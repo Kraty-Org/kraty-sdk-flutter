@@ -325,6 +325,47 @@ class RewardPolicySummary {
       );
 }
 
+/// How much of the player's attempt allowance on this event window is
+/// spent, for an entry counter ("Play — 1/2 today").
+///
+/// The `used*` counts include a live attempt: an entry is spent when it
+/// starts, not when it finishes. A counter is only populated when the
+/// matching cap is set — an uncapped event reports `0` used and a null
+/// maximum. [remaining] is the tightest configured cap, null when the
+/// event caps nothing.
+class AttemptQuota {
+  /// Attempts allowed for the whole window; null = unlimited.
+  final int? maxPerWindow;
+  final int usedInWindow;
+
+  /// Attempts allowed per local calendar day; null = unlimited.
+  final int? maxPerDay;
+  final int usedToday;
+
+  /// What the player can still start now; null = unlimited.
+  final int? remaining;
+
+  const AttemptQuota({
+    required this.maxPerWindow,
+    required this.usedInWindow,
+    required this.maxPerDay,
+    required this.usedToday,
+    required this.remaining,
+  });
+
+  /// True when a cap is configured and fully spent, so the next
+  /// `events.start` would be refused. Drives a disabled Play button.
+  bool get isExhausted => remaining == 0;
+
+  factory AttemptQuota.fromJson(JsonMap json) => AttemptQuota(
+        maxPerWindow: json['maxPerWindow'] is num ? (json['maxPerWindow']! as num).toInt() : null,
+        usedInWindow: json['usedInWindow'] is num ? (json['usedInWindow']! as num).toInt() : 0,
+        maxPerDay: json['maxPerDay'] is num ? (json['maxPerDay']! as num).toInt() : null,
+        usedToday: json['usedToday'] is num ? (json['usedToday']! as num).toInt() : 0,
+        remaining: json['remaining'] is num ? (json['remaining']! as num).toInt() : null,
+      );
+}
+
 class EventListing {
   final String eventKey;
 
@@ -372,6 +413,11 @@ class EventListing {
   /// modern backends always set it (`{ type: 'none' }` at minimum).
   final RewardPolicySummary? rewardPolicy;
 
+  /// Attempts spent vs. allowed for this player. `null` only on
+  /// backends older than the attempt-quota field; a modern backend
+  /// always sets it (null maxima when the event caps nothing).
+  final AttemptQuota? attemptQuota;
+
   const EventListing({
     required this.eventKey,
     required this.name,
@@ -388,6 +434,7 @@ class EventListing {
     required this.metadata,
     required this.milestoneRewards,
     required this.rewardPolicy,
+    required this.attemptQuota,
   });
 
   /// True when [leaderboardMode] is `lobby_matched`. Convenience
@@ -422,6 +469,9 @@ class EventListing {
             .toList(growable: false),
         rewardPolicy: json['rewardPolicy'] is Map
             ? RewardPolicySummary.fromJson((json['rewardPolicy']! as Map).cast<String, Object?>())
+            : null,
+        attemptQuota: json['attemptQuota'] is Map
+            ? AttemptQuota.fromJson((json['attemptQuota']! as Map).cast<String, Object?>())
             : null,
       );
 }

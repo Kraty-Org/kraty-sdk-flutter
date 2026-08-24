@@ -47,6 +47,7 @@ export 'src/resources.dart' show
     pollPendingGrants;
 export 'src/types.dart' show
     Attempt,
+    AttemptQuota,
     BlockedPlayer,
     BoardStandings,
     Catalog,
