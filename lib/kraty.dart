@@ -105,12 +105,15 @@ export 'src/types.dart' show
     SendGiftInput,
     ServerTime,
     StandingsReadOptions,
-    StandingsSegment;
+    StandingsSegment,
+    TrackPurchaseInput,
+    TrackPurchaseResult;
 
 import 'src/client.dart';
 import 'src/finalization.dart';
 import 'src/resources.dart';
-import 'src/types.dart' show ServerTime;
+import 'src/types.dart'
+    show ServerTime, TrackPurchaseInput, TrackPurchaseResult;
 
 export 'src/secret_store.dart' show
     DefaultSecretStore,
@@ -158,6 +161,7 @@ class Kraty {
   final InventoryClient inventory;
   final WalletClient wallet;
   final PlayersClient players;
+  final PurchasesClient purchases;
   final FriendsClient friends;
   final CatalogClient catalog;
 
@@ -171,6 +175,7 @@ class Kraty {
     required this.inventory,
     required this.wallet,
     required this.players,
+    required this.purchases,
     required this.friends,
     required this.catalog,
   });
@@ -187,10 +192,27 @@ class Kraty {
       inventory: InventoryClient(c),
       wallet: WalletClient(c),
       players: PlayersClient(c),
+      purchases: PurchasesClient(c),
       friends: FriendsClient(c),
       catalog: CatalogClient(c),
     );
   }
+
+  /// Record a real-money purchase for the active player.
+  ///
+  /// Shorthand for `kraty.purchases.track(...)`, promoted to the top
+  /// level because reporting a purchase is a one-liner a game does
+  /// from inside its store callback and shouldn't have to reach
+  /// through a namespace for.
+  ///
+  /// Idempotent on `transactionId`, so calling it unconditionally on
+  /// every restore — without tracking what you already reported — is
+  /// the intended usage.
+  Future<TrackPurchaseResult> trackPurchase(
+    TrackPurchaseInput input, {
+    String? as,
+  }) =>
+      purchases.track(input, as: as);
 
   /// The active player this SDK currently represents. Returns null
   /// until the first player-scoped call resolves the identity (or

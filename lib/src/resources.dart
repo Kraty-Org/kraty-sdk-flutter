@@ -738,6 +738,60 @@ class CollectAllResult {
 /// empty (the studio's own backend holds the canonical state). The
 /// SDK doesn't expose grant or admin-credit endpoints; those are
 /// server-API only.
+/// Real-money purchase reporting.
+///
+/// Deliberately WRITE-ONLY. There is no client-side read of a player's
+/// spend total: it is a monetization signal worth keeping out of a
+/// shipped binary, and games that gate content on spend don't need it —
+/// the backend evaluates a `spend_at_least` unlock condition
+/// server-side and the event simply arrives locked or unlocked.
+class PurchasesClient {
+  final KratyClient _client;
+
+  PurchasesClient(this._client);
+
+  /// `POST /sdk/v1/players/:p/purchases`: record a real-money purchase
+  /// for the active player.
+  ///
+  /// Call it the moment your store plugin confirms the transaction.
+  /// Safe to call repeatedly for one [TrackPurchaseInput.transactionId]
+  /// — restores, retries after a timeout, and app relaunches all
+  /// collapse onto a single ledger row, and the result's
+  /// `deduplicated` flag tells you which happened.
+  ///
+  /// ```dart
+  /// final result = await kraty.trackPurchase(TrackPurchaseInput(
+  ///   transactionId: tx.purchaseID,
+  ///   store: 'app_store',
+  ///   productId: 'gems_500',
+  ///   amountMinor: 499, // \$4.99 — minor units, as charged
+  ///   currency: 'USD',
+  ///   receipt: tx.verificationData.serverVerificationData,
+  /// ));
+  /// ```
+  ///
+  /// Throws [KratyApiError] with code `unknown_currency` if Kraty holds
+  /// no FX rate for the currency — a configuration gap, not a player
+  /// problem, so surface it in QA rather than retrying.
+  Future<TrackPurchaseResult> track(
+    TrackPurchaseInput input, {
+    String? as,
+  }) async {
+    final externalPlayerId = await _resolvePlayerId(_client, as);
+    final env = await _client.request(
+      method: 'POST',
+      path: '/sdk/v1/players/${_enc(externalPlayerId)}/purchases',
+      body: input.toJson(),
+    );
+    return _data<TrackPurchaseResult>(env, (raw) {
+      if (raw is Map) {
+        return TrackPurchaseResult.fromJson(raw.cast<String, Object?>());
+      }
+      return TrackPurchaseResult.fromJson(const <String, Object?>{});
+    });
+  }
+}
+
 class InventoryClient {
   final KratyClient _client;
 

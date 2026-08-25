@@ -1284,6 +1284,146 @@ class ConsumeItemResult {
       );
 }
 
+/// Input for `PurchasesClient.track` (a.k.a. `kraty.trackPurchase`).
+///
+/// [amountMinor] is in the currency's MINOR units as charged — cents
+/// for USD, whole yen for JPY. Every store plugin already reports
+/// minor units, so pass theirs through unchanged rather than
+/// converting to a double; money and floating point don't mix.
+///
+/// There is no `idempotencyKey`: [transactionId] IS the idempotency
+/// key and it comes from the store. Calling this repeatedly for one
+/// transaction records nothing new and moves no total, so calling it
+/// unconditionally on every restore is the intended usage.
+class TrackPurchaseInput {
+  /// The store's transaction id. Used for dedupe.
+  final String transactionId;
+
+  /// One of `app_store`, `google_play`, `steam`, `epic`, `amazon`,
+  /// `microsoft`, `playstation`, `nintendo`, `web`, `other`.
+  final String store;
+
+  /// The store's product id / SKU.
+  final String productId;
+
+  /// One of `consumable`, `non_consumable`, `subscription`.
+  final String? productType;
+
+  /// Minor units as charged: `499` is $4.99 in USD, ¥499 in JPY.
+  final int amountMinor;
+
+  /// ISO 4217 alpha-3, e.g. `'USD'`, `'BRL'`, `'JPY'`.
+  final String currency;
+
+  /// Store receipt / purchase token, retained for later validation.
+  final String? receipt;
+
+  /// ISO-8601. Defaults to the server's clock when null.
+  final String? purchasedAt;
+
+  /// Arbitrary studio fields: campaign id, offer id, A/B bucket, ….
+  final JsonMap? metadata;
+
+  const TrackPurchaseInput({
+    required this.transactionId,
+    required this.store,
+    required this.productId,
+    required this.amountMinor,
+    required this.currency,
+    this.productType,
+    this.receipt,
+    this.purchasedAt,
+    this.metadata,
+  });
+
+  JsonMap toJson() => <String, Object?>{
+        'transactionId': transactionId,
+        'store': store,
+        'productId': productId,
+        'amountMinor': amountMinor,
+        'currency': currency,
+        if (productType != null) 'productType': productType,
+        if (receipt != null) 'receipt': receipt,
+        if (purchasedAt != null) 'purchasedAt': purchasedAt,
+        if (metadata != null) 'metadata': metadata,
+      };
+}
+
+/// Result of `kraty.trackPurchase`. Carries both what the player was
+/// charged ([amountMinor] + [currency]) and the normalized USD value
+/// ([normalizedAmountMinor], always USD cents) that spend thresholds
+/// and revenue reporting compare against.
+///
+/// [deduplicated] is true when this transaction id was already on
+/// file. That is a success, not an error: the client asked "is this
+/// recorded?" and the answer is yes.
+class TrackPurchaseResult {
+  final String purchaseId;
+  final String transactionId;
+  final String store;
+  final String productId;
+  final String? productType;
+  final int amountMinor;
+  final String currency;
+
+  /// USD cents.
+  final int normalizedAmountMinor;
+
+  /// Always `'USD'`. Present so callers never hardcode the base currency.
+  final String normalizedCurrency;
+  final double fxRate;
+
+  /// One of `unverified`, `verified`, `failed`, `skipped`.
+  final String validationStatus;
+  final String purchasedAt;
+  final JsonMap metadata;
+
+  /// True when this transaction id was already on file — a replay.
+  final bool deduplicated;
+
+  /// The player's lifetime spend in USD cents, after this purchase.
+  final int lifetimeAmountMinor;
+  final int purchaseCount;
+
+  const TrackPurchaseResult({
+    required this.purchaseId,
+    required this.transactionId,
+    required this.store,
+    required this.productId,
+    required this.amountMinor,
+    required this.currency,
+    required this.normalizedAmountMinor,
+    required this.normalizedCurrency,
+    required this.fxRate,
+    required this.validationStatus,
+    required this.purchasedAt,
+    required this.metadata,
+    required this.deduplicated,
+    required this.lifetimeAmountMinor,
+    required this.purchaseCount,
+    this.productType,
+  });
+
+  factory TrackPurchaseResult.fromJson(JsonMap json) => TrackPurchaseResult(
+        purchaseId: _readString(json, 'purchaseId'),
+        transactionId: _readString(json, 'transactionId'),
+        store: _readString(json, 'store'),
+        productId: _readString(json, 'productId'),
+        productType: json['productType'] as String?,
+        amountMinor: _readInt(json, 'amountMinor'),
+        currency: _readString(json, 'currency'),
+        normalizedAmountMinor: _readInt(json, 'normalizedAmountMinor'),
+        normalizedCurrency: _readString(json, 'normalizedCurrency'),
+        fxRate: _readDouble(json, 'fxRate'),
+        validationStatus: _readString(json, 'validationStatus'),
+        purchasedAt: _readString(json, 'purchasedAt'),
+        metadata: _readObjectMap(json, 'metadata'),
+        deduplicated: _readBool(json, 'deduplicated'),
+        lifetimeAmountMinor: _readInt(json, 'lifetimeAmountMinor'),
+        purchaseCount: _readInt(json, 'purchaseCount'),
+      );
+}
+
 /// Input for `WalletClient.debit`. Same idempotency story as
 /// [ConsumeItemInput]. Credits are intentionally NOT in the SDK:
 /// only the studio's backend (`/server/v1/...`) can mint balance, so
