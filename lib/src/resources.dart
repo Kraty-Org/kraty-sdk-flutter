@@ -1289,6 +1289,42 @@ class FriendsClient {
     });
   }
 
+  /// `GET /sdk/v1/players/:externalId/friends/suggestions`: "people you may
+  /// want to add" — recently-active players in the same game + environment
+  /// the caller isn't already related to (not a friend, no pending request
+  /// either way, not blocked). Results are a weighted-random sample biased
+  /// toward the most recently active, so calling it again surfaces a
+  /// different set. [limit] defaults to 5 server-side (clamped 1–25).
+  Future<List<Suggestion>> suggestions({
+    int? limit,
+    List<String>? progression,
+    String? as,
+  }) async {
+    final externalPlayerId = await _resolvePlayerId(_client, as);
+    final qs = <String>[];
+    if (limit != null) qs.add('limit=$limit');
+    if (progression != null && progression.isNotEmpty) {
+      qs.add('progression=${_enc(progression.join(','))}');
+    }
+    final env = await _client.request(
+      method: 'GET',
+      path:
+          '/sdk/v1/players/${_enc(externalPlayerId)}/friends/suggestions${qs.isEmpty ? '' : '?${qs.join('&')}'}',
+    );
+    return _data<List<Suggestion>>(env, (raw) {
+      if (raw is Map) {
+        final suggestions = raw['suggestions'];
+        if (suggestions is List) {
+          return suggestions
+              .whereType<Map<String, Object?>>()
+              .map((e) => Suggestion.fromJson(e.cast<String, Object?>()))
+              .toList(growable: false);
+        }
+      }
+      return const <Suggestion>[];
+    });
+  }
+
   /// `GET /sdk/v1/players/:externalId/friends/requests`: the caller's
   /// pending incoming + outgoing friend requests.
   ///

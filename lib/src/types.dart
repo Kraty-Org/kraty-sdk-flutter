@@ -1783,6 +1783,44 @@ class Friend {
       );
 }
 
+/// A suggested player to add — a recently-active non-friend the caller has
+/// no relationship with. Same identity + live-presence shape as [Friend],
+/// minus the friendship-specific `friendsSince` / `giftCooldownUntil`
+/// (there's no edge yet). Returned by `friends.suggestions()`.
+class Suggestion {
+  final String externalPlayerId;
+  final PlayerIdentity? displayIdentity;
+  final bool online;
+
+  /// ISO timestamp of their last heartbeat, or `null` when never/expired.
+  final String? lastActiveAt;
+
+  /// Free-form client-set status ("in_match", "lobby", …), or `null`.
+  final String? status;
+
+  /// Progression balances requested via
+  /// `friends.suggestions(progression: [...])`, e.g. `{ 'level': 12 }`.
+  final Map<String, int>? progression;
+
+  const Suggestion({
+    required this.externalPlayerId,
+    required this.displayIdentity,
+    required this.online,
+    required this.lastActiveAt,
+    required this.status,
+    this.progression,
+  });
+
+  factory Suggestion.fromJson(JsonMap json) => Suggestion(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+        online: _readBool(json, 'online'),
+        lastActiveAt: _readNullableString(json, 'lastActiveAt'),
+        status: _readNullableString(json, 'status'),
+        progression: _readProgression(json, 'progression'),
+      );
+}
+
 /// The caller's shareable friend code + display identity.
 class FriendCode {
   final String friendCode;

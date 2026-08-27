@@ -4,6 +4,13 @@ All notable changes to `kraty` (Kraty Dart / Flutter SDK) live here.
 Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [SemVer](https://semver.org/).
 
+## [0.29.0](https://github.com/Kraty-Org/Kraty/compare/sdk-client-flutter-v0.28.0...sdk-client-flutter-v0.29.0) (2026-08-27)
+
+
+### Features
+
+* **friends:** friend suggestions endpoint + all client SDKs ([#76](https://github.com/Kraty-Org/Kraty/issues/76)) ([2b1715c](https://github.com/Kraty-Org/Kraty/commit/2b1715c346f8a391f1bb169af5229f329ce51947))
+
 ## [0.28.0](https://github.com/Kraty-Org/Kraty/compare/sdk-client-flutter-v0.27.0...sdk-client-flutter-v0.28.0) (2026-08-26)
 
 

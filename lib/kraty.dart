@@ -106,6 +106,7 @@ export 'src/types.dart' show
     ServerTime,
     StandingsReadOptions,
     StandingsSegment,
+    Suggestion,
     TrackPurchaseInput,
     TrackPurchaseResult;
 

@@ -868,6 +868,32 @@ void main() {
       kraty.close();
     });
 
+    test('suggestions unwraps { suggestions: [...] } and sends limit + progression', () async {
+      final fake = FakeClient()
+        ..push(200, body: {
+          'data': {
+            'suggestions': [
+              {
+                'externalPlayerId': 'carol',
+                'displayIdentity': {'name': 'Carol'},
+                'online': false,
+                'lastActiveAt': null,
+                'status': null,
+              },
+            ],
+          },
+        });
+      final kraty = Kraty(_opts(fake));
+      final suggestions = await kraty.friends
+          .suggestions(limit: 5, progression: ['level'], as: 'alice');
+      expect(suggestions, hasLength(1));
+      expect(suggestions.first.externalPlayerId, 'carol');
+      expect(suggestions.first.online, false);
+      expect(fake.calls.single.url,
+          '$_baseUrl/sdk/v1/players/alice/friends/suggestions?limit=5&progression=level');
+      kraty.close();
+    });
+
     test('decline / cancelRequest / remove / unblock hit the right verbs', () async {
       final fake = FakeClient()
         ..push(200, body: {'data': {'declined': true}})
