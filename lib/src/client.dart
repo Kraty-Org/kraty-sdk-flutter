@@ -2,8 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import 'errors.dart';
 import 'finalization.dart';
@@ -16,7 +19,7 @@ import 'types.dart' show EventLeaderboard, ServerTime;
 /// for graceful deprecation handling. Bump in lockstep with
 /// `pubspec.yaml` `version`.
 const String _sdkName = 'kraty-flutter';
-const String _sdkVersion = '0.9.0';
+const String _sdkVersion = '0.30.0';
 const String _sdkUserAgent = '$_sdkName/$_sdkVersion';
 
 /// Telemetry record fired after every HTTP attempt.
@@ -113,6 +116,20 @@ class KratyClientOptions {
   /// pure-Dart CLIs.
   final MembershipStore? membershipStore;
 
+  /// Platform this client runs on, sent as `X-Kraty-Platform` on every
+  /// request so the dashboard can split players by device. Leave unset
+  /// and the SDK reads `defaultTargetPlatform` / `kIsWeb` — `ios`,
+  /// `android`, `web`, `windows`, `macos`, `linux`. Set it to the key of a
+  /// platform you defined in the game's Settings → Platforms to report
+  /// that instead.
+  final String? platform;
+
+  /// Your game's build version, sent as `X-Kraty-App-Version` on every
+  /// request and shown on the player's profile. Leave unset and the SDK
+  /// reads it from the app bundle (`package_info_plus`) on the first
+  /// request; set it to override (e.g. to include a build number).
+  final String? appVersion;
+
   const KratyClientOptions({
     required this.apiKey,
     this.baseUrl = 'https://api.kraty.io',
@@ -125,7 +142,38 @@ class KratyClientOptions {
     this.activeExternalPlayerId,
     this.secretStore,
     this.membershipStore,
+    this.platform,
+    this.appVersion,
   });
+}
+
+/// Same slug rule the backend applies; anything else is dropped, not sent.
+final RegExp _platformKey = RegExp(r'^[a-z0-9][a-z0-9_-]{0,31}$');
+
+String? _normalizePlatform(String? raw) {
+  if (raw == null) return null;
+  final key = raw.trim().toLowerCase();
+  return _platformKey.hasMatch(key) ? key : null;
+}
+
+/// `kIsWeb` is a compile-time constant and `defaultTargetPlatform` needs
+/// no binding, so this is safe to call from a constructor.
+String? _detectPlatform() {
+  if (kIsWeb) return 'web';
+  switch (defaultTargetPlatform) {
+    case TargetPlatform.iOS:
+      return 'ios';
+    case TargetPlatform.android:
+      return 'android';
+    case TargetPlatform.macOS:
+      return 'macos';
+    case TargetPlatform.windows:
+      return 'windows';
+    case TargetPlatform.linux:
+      return 'linux';
+    case TargetPlatform.fuchsia:
+      return null;
+  }
 }
 
 /// Set of methods we auto-stamp with `idempotencyKey` if the body
@@ -153,6 +201,14 @@ class KratyClient {
   final http.Client _http;
   final bool _ownsHttp;
   final String _authHeader;
+  // Device telemetry headers (see KratyClientOptions.platform / appVersion).
+  // The version is resolved lazily: `PackageInfo.fromPlatform()` is async
+  // and needs the Flutter binding, so the constructor can't read it. The
+  // first request awaits the probe; the result (or null in a pure-Dart
+  // process) is cached for the client's lifetime.
+  final String? _platform;
+  String? _appVersion;
+  Future<String?>? _appVersionProbe;
   // Identity is mutable on purpose: `ensureIdentity()` may register
   // or restore a player after construction and writes back here so
   // subsequent calls skip the round-trip.
@@ -184,6 +240,10 @@ class KratyClient {
         _http = options.httpClient ?? http.Client(),
         _ownsHttp = options.httpClient == null,
         _authHeader = 'Bearer ${_validateApiKey(options.apiKey)}',
+        _platform = _normalizePlatform(options.platform) ?? _detectPlatform(),
+        _appVersion = (options.appVersion?.trim().isEmpty ?? true)
+            ? null
+            : options.appVersion!.trim(),
         _playerSecret = (options.playerSecret != null &&
                 options.playerSecret!.isNotEmpty)
             ? options.playerSecret
@@ -565,16 +625,37 @@ class KratyClient {
     throw const KratyNetworkError('exhausted retries');
   }
 
+  /// The build version to report, detecting it once when the studio
+  /// didn't pass one. Never throws: a missing plugin (pure-Dart CLI,
+  /// tests) just means no header.
+  Future<String?> _resolveAppVersion() {
+    if (_appVersion != null) return Future.value(_appVersion);
+    return _appVersionProbe ??= () async {
+      try {
+        final info = await PackageInfo.fromPlatform();
+        final v = info.version.trim();
+        if (v.isNotEmpty) _appVersion = v;
+      } catch (_) {
+        // MissingPluginException outside a Flutter binding, or any
+        // platform-channel failure: report nothing rather than fail.
+      }
+      return _appVersion;
+    }();
+  }
+
   Future<http.Response> _fireOnce(
     String method,
     String url,
     Object? body,
   ) async {
     final secret = _playerSecret;
+    final appVersion = await _resolveAppVersion();
     final headers = <String, String>{
       'authorization': _authHeader,
       'accept': 'application/json',
       'x-kraty-sdk': _sdkUserAgent,
+      if (_platform != null) 'x-kraty-platform': _platform,
+      if (appVersion != null) 'x-kraty-app-version': appVersion,
       if (body != null) 'content-type': 'application/json',
       if (secret != null && secret.isNotEmpty) 'x-player-secret': secret,
     };

@@ -92,6 +92,38 @@ void main() {
       client.close();
     });
 
+    test('sends an explicit platform + app version as X-Kraty-* headers', () async {
+      final fake = FakeClient()..push(200, body: {'ok': true});
+      final client = KratyClient(KratyClientOptions(
+        apiKey: _apiKey,
+        baseUrl: _baseUrl,
+        httpClient: fake,
+        platform: ' Steam_Deck ', // normalized like the server does
+        appVersion: '1.4.2+318',
+      ));
+      await client.request(method: 'GET', path: '/sdk/v1/ping');
+      expect(fake.calls[0].headers['x-kraty-platform'], 'steam_deck');
+      expect(fake.calls[0].headers['x-kraty-app-version'], '1.4.2+318');
+      client.close();
+    });
+
+    test('drops a malformed platform key instead of sending it', () async {
+      final fake = FakeClient()..push(200, body: {'ok': true});
+      final client = KratyClient(KratyClientOptions(
+        apiKey: _apiKey,
+        baseUrl: _baseUrl,
+        httpClient: fake,
+        platform: 'not a key',
+      ));
+      await client.request(method: 'GET', path: '/sdk/v1/ping');
+      // Detection still runs (the test host reports its own platform);
+      // what must NOT happen is the malformed override going on the wire.
+      expect(fake.calls[0].headers['x-kraty-platform'], isNot('not a key'));
+      // No plugin in a test binding → no version header, no crash.
+      expect(fake.calls[0].headers.containsKey('x-kraty-app-version'), isFalse);
+      client.close();
+    });
+
     test('stamps idempotencyKey on POST when the body has none', () async {
       var counter = 0;
       String gen() => 'idem-${++counter}';
