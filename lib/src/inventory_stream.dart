@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:http/http.dart' as http;
 
+import 'reconnecting_sse.dart';
 import 'sse.dart';
 
 /// Live feed of everything that touches a player's items, wallet, and
@@ -76,24 +77,43 @@ class InventoryStreamEvent {
 }
 
 /// Handle to an active inventory subscription. Call [cancel] to stop.
+///
+/// By default the stream heals itself: after a server `close`, a network
+/// drop, a busy server or heartbeat silence it reconnects on its own (no
+/// replay: re-read what you show on `connected`). With
+/// `autoReconnect: false` it is a single connection and [errors] carries
+/// transport failures.
 class InventoryStream {
   /// Server-pushed events. Single-subscriber.
   final Stream<InventoryStreamEvent> events;
 
-  /// Transport failures. The SDK does NOT auto-reconnect; listen here and
-  /// re-invoke `inventory.live()` after a backoff if you want resumption.
+  /// With auto-reconnect: fatal errors only (the stream ends after one).
+  /// Without: transport failures; re-invoke `inventory.live()` after a
+  /// backoff if you want resumption. Broadcast.
   final Stream<Object> errors;
 
+  /// Connection status (`connected` / `reconnecting`); see
+  /// [KratyConnectionEvent]. Single-subscriber and buffered. Empty with
+  /// `autoReconnect: false`.
+  final Stream<KratyConnectionEvent> connection;
+
+  final KratyConnectionState Function() _state;
   final Future<void> Function() _cancel;
 
-  const InventoryStream._(this.events, this.errors, this._cancel);
+  InventoryStream._(this.events, this.errors, this.connection, this._state, this._cancel);
 
-  /// Cancels the subscription + closes the HTTP socket. Idempotent.
+  /// The current connection state. Always `connected` with
+  /// `autoReconnect: false`.
+  KratyConnectionState get connectionState => _state();
+
+  /// Cancels the subscription, closes the HTTP socket and cancels any
+  /// pending reconnect. Idempotent.
   Future<void> cancel() => _cancel();
 }
 
 /// Opens an SSE subscription to a player's inventory / wallet / grants.
-/// Does NOT auto-reconnect.
+/// With [autoReconnect] it reconnects itself; without, a single
+/// connection.
 Future<InventoryStream> openInventoryStream({
   required String baseUrl,
   required String externalPlayerId,
@@ -101,19 +121,36 @@ Future<InventoryStream> openInventoryStream({
   required http.Client httpClient,
   required String sdkUserAgent,
   String? playerSecret,
+  String? Function()? currentPlayerSecret,
+  bool autoReconnect = false,
+  Duration heartbeatTimeout = const Duration(seconds: 40),
 }) async {
-  final raw = await openSseStream(
-    baseUrl: baseUrl,
-    path: '/sdk/v1/players/${Uri.encodeComponent(externalPlayerId)}/inventory/stream',
-    authHeader: authHeader,
-    httpClient: httpClient,
-    sdkUserAgent: sdkUserAgent,
-    label: 'inventory stream',
-    playerSecret: playerSecret,
+  Future<SseStream> connect({void Function()? onActivity}) => openSseStream(
+        baseUrl: baseUrl,
+        path: '/sdk/v1/players/${Uri.encodeComponent(externalPlayerId)}/inventory/stream',
+        authHeader: authHeader,
+        httpClient: httpClient,
+        sdkUserAgent: sdkUserAgent,
+        label: 'inventory stream',
+        playerSecret: currentPlayerSecret?.call() ?? playerSecret,
+        onActivity: onActivity,
+      );
+  InventoryStreamEvent map(SseEvent e) => InventoryStreamEvent(kind: e.kind, data: e.data);
+
+  if (!autoReconnect) {
+    final raw = await connect();
+    return InventoryStream._(
+      raw.events.map(map),
+      raw.errors,
+      const Stream<KratyConnectionEvent>.empty(),
+      () => KratyConnectionState.connected,
+      raw.cancel,
+    );
+  }
+  final core = ReconnectingSse(
+    connect: (onActivity) => connect(onActivity: onActivity),
+    heartbeatTimeout: heartbeatTimeout,
   );
-  return InventoryStream._(
-    raw.events.map((e) => InventoryStreamEvent(kind: e.kind, data: e.data)),
-    raw.errors,
-    raw.cancel,
-  );
+  await core.start();
+  return InventoryStream._(core.events.map(map), core.errors, core.connection, () => core.state, core.cancel);
 }

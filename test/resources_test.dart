@@ -710,7 +710,12 @@ void main() {
         ..push(200, body: <String, Object?>{
           'data': <String, Object?>{
             'kinds': <String, Object?>{
-              'direct': <String, Object?>{'enabled': true, 'profanityFilter': 'on_by_default', 'allowFrom': 'friends'},
+              'direct': <String, Object?>{
+                'enabled': true,
+                'profanityFilter': 'on_by_default',
+                'cooldownSeconds': 3,
+                'allowFrom': 'friends',
+              },
               'group': <String, Object?>{
                 'enabled': true,
                 'profanityFilter': 'always',
@@ -727,6 +732,9 @@ void main() {
                 'description': null,
                 'postPolicy': 'players',
                 'slowModeSeconds': 5,
+                'cooldownSeconds': 20,
+                'roomSize': 250,
+                'room': 0,
                 'requirement': <String, Object?>{'itemKey': 'level', 'threshold': 3},
                 'metadata': <String, Object?>{},
                 'profanityFilter': 'always',
@@ -740,7 +748,7 @@ void main() {
               ],
               'editWindowSeconds': 300,
             },
-            'rateLimit': <String, Object?>{'messagesPerMinute': 20},
+            'rateLimit': <String, Object?>{'messagesPerMinute': 20, 'duplicateWindowSeconds': 60},
             'preferences': <String, Object?>{'profanityFilter': null, 'allowDirectFrom': 'everyone'},
             'status': <String, Object?>{
               'canChat': true,
@@ -783,6 +791,11 @@ void main() {
       expect(cfg.customTypes.single.key, 'match_invite');
       expect(cfg.editWindowSeconds, 300);
       expect(cfg.messagesPerMinute, 20);
+      expect(cfg.duplicateWindowSeconds, 60);
+      expect(cfg.kinds['direct']!.cooldownSeconds, 3);
+      expect(cfg.channels.single.cooldownSeconds, 20);
+      expect(cfg.channels.single.roomSize, 250);
+      expect(cfg.channels.single.room, 0);
       expect(cfg.preferences.profanityFilter, isNull);
       expect(cfg.preferences.allowDirectFrom, 'everyone');
       expect(cfg.status.canPost, isFalse);
@@ -1131,7 +1144,7 @@ void main() {
           'externalPlayerId': 'alice',
           'conversationIds': <Object?>[c],
           'channels': <Object?>[
-            <String, Object?>{'key': 'global', 'conversationId': 'ch1'},
+            <String, Object?>{'key': 'global', 'conversationId': 'ch1', 'room': 2},
           ],
         }))
         ..write(': ping 1\n\n')
@@ -1159,10 +1172,10 @@ void main() {
         }))
         ..write(ev('restriction_lifted', <String, Object?>{'restrictionId': 'r1', 'kind': 'chat_mute'}))
         ..write(ev('something_new', <String, Object?>{'x': 1}))
-        ..write(ev('close', <String, Object?>{'reason': 'draining'}));
+        ..write(ev('close', <String, Object?>{'reason': 'slow_consumer'}));
       final fake = FakeClient()..push(200, body: sse.toString(), headers: <String, String>{'content-type': 'text/event-stream'});
       final kraty = Kraty(chatOpts(fake, filter: false));
-      final stream = await kraty.chat.live(channels: <String>['global', 'es'], as: 'alice');
+      final stream = await kraty.chat.live(channels: <String>['global', 'es'], as: 'alice', autoReconnect: false);
       final events = await stream.events.toList();
       await stream.cancel();
 
@@ -1193,6 +1206,7 @@ void main() {
       expect(ready.conversationIds, <String>[c]);
       expect(ready.channels.single.key, 'global');
       expect(ready.channels.single.conversationId, 'ch1');
+      expect(ready.channels.single.room, 2);
       expect((events[1] as ChatMessageEvent).message.seq, 10);
       expect((events[1] as ChatMessageEvent).message.sender.player!.externalPlayerId, 'bob');
       expect((events[1] as ChatMessageEvent).message.editedAt, isNull);
@@ -1217,14 +1231,159 @@ void main() {
       expect(restriction.expiresAt, '2026-10-16T00:00:00.000Z');
       expect((events[10] as ChatRestrictionLiftedEvent).restrictionId, 'r1');
       expect(events[11], isA<ChatUnknownEvent>());
-      expect((events[12] as ChatCloseEvent).reason, 'draining');
+      expect((events[12] as ChatCloseEvent).reason, 'slow_consumer');
       kraty.close();
+    });
+
+    group('anti-spam', () {
+      KratyClientOptions retryingOpts(FakeClient fake) => KratyClientOptions(
+            apiKey: _apiKey,
+            baseUrl: _baseUrl,
+            httpClient: fake,
+            playerSecret: 'sek',
+            generateIdempotencyKey: () => 'fixed-idem',
+            retry: const KratyRetryConfig(
+              attempts: 4,
+              initialDelay: Duration(milliseconds: 1),
+              maxDelay: Duration(milliseconds: 5),
+              jitter: 0,
+            ),
+            timeout: const Duration(seconds: 1),
+          );
+
+      Map<String, Object?> refusal(String code, Map<String, Object?> details) => <String, Object?>{
+            'error': <String, Object?>{'code': code, 'message': 'refused', 'details': details},
+          };
+
+      Map<String, Object?> channelConv({int cooldown = 30}) => <String, Object?>{
+            ...conversation(kind: 'channel'),
+            'channel': <String, Object?>{
+              'key': 'global',
+              'name': 'Global',
+              'description': null,
+              'postPolicy': 'players',
+              'slowModeSeconds': 0,
+              'cooldownSeconds': cooldown,
+              'roomSize': 250,
+              'room': 1,
+              'requirement': null,
+              'metadata': <String, Object?>{},
+            },
+          };
+
+      test('send and editMessage never retry a 429; retryAfterSeconds is readable', () async {
+        final fake = FakeClient()
+          ..push(429, body: refusal('chat_slow_mode', <String, Object?>{'retryAfterSeconds': 12, 'cooldownSeconds': 15}))
+          ..push(429, body: refusal('chat_duplicate_message', <String, Object?>{'retryAfterSeconds': 50}));
+        final kraty = Kraty(retryingOpts(fake));
+        try {
+          await kraty.chat.send(c, 'hi', as: 'alice');
+          fail('expected KratyApiError');
+        } on KratyApiError catch (err) {
+          expect(err.status, 429);
+          expect(err.isChatSlowMode, isTrue);
+          expect(err.isChatRateLimited, isTrue);
+          expect(err.retryAfterSeconds, 12);
+        }
+        expect(fake.calls, hasLength(1));
+        try {
+          await kraty.chat.editMessage(c, m, 'hi', as: 'alice');
+          fail('expected KratyApiError');
+        } on KratyApiError catch (err) {
+          expect(err.isChatDuplicateMessage, isTrue);
+          expect(err.retryAfterSeconds, 50);
+        }
+        expect(fake.calls, hasLength(2));
+        kraty.close();
+      });
+
+      test('other calls still retry a 429; a 5xx retry of a send keeps its clientMessageId', () async {
+        final fake = FakeClient()
+          ..push(429, body: refusal('rate_limited', <String, Object?>{}))
+          ..push(200, body: <String, Object?>{'data': <String, Object?>{'total': 0}})
+          ..push(503, body: refusal('internal_error', <String, Object?>{}))
+          ..push(201, body: <String, Object?>{'data': message()});
+        final kraty = Kraty(retryingOpts(fake));
+        await kraty.chat.unread(as: 'alice');
+        expect(fake.calls, hasLength(2));
+        await kraty.chat.send(c, 'hi', as: 'alice');
+        expect(fake.calls, hasLength(4));
+        final first = (jsonDecode(fake.calls[2].body!) as Map<String, Object?>)['clientMessageId'];
+        final second = (jsonDecode(fake.calls[3].body!) as Map<String, Object?>)['clientMessageId'];
+        expect(first, matches(uuidRe));
+        expect(second, first);
+        kraty.close();
+      });
+
+      test('cooldownRemaining follows the channel cooldown, the config kinds and 429s', () async {
+        final fake = FakeClient()
+          ..push(200, body: <String, Object?>{'data': channelConv(cooldown: 30)})
+          ..push(201, body: <String, Object?>{'data': message()})
+          ..push(200, body: <String, Object?>{
+            'data': <String, Object?>{
+              'kinds': <String, Object?>{
+                'direct': <String, Object?>{'enabled': true, 'profanityFilter': 'always', 'cooldownSeconds': 40},
+              },
+            },
+          })
+          ..push(200, body: <String, Object?>{'data': <String, Object?>{...conversation(), 'conversationId': 'd1'}})
+          ..push(201, body: <String, Object?>{'data': message()})
+          ..push(429, body: refusal('chat_slow_mode', <String, Object?>{'retryAfterSeconds': 90, 'cooldownSeconds': 90}))
+          ..push(429, body: refusal('chat_rate_limited', <String, Object?>{'retryAfterSeconds': 90, 'limitPerMinute': 30}));
+        final kraty = Kraty(chatOpts(fake));
+        expect(kraty.chat.cooldownRemaining(c), 0);
+        final ch = await kraty.chat.channel('global', as: 'alice');
+        expect(ch.channel!.room, 1);
+        await kraty.chat.send(c, 'hi all', as: 'alice');
+        expect(kraty.chat.cooldownRemaining(c), inInclusiveRange(29, 30));
+
+        await kraty.chat.config(as: 'alice');
+        await kraty.chat.conversation('d1', as: 'alice');
+        await kraty.chat.send('d1', 'hey', as: 'alice');
+        expect(kraty.chat.cooldownRemaining('d1'), inInclusiveRange(39, 40));
+        // In cooldown: refused locally, no request.
+        final callsBefore = fake.calls.length;
+        try {
+          await kraty.chat.send('d1', 'hey', as: 'alice');
+          fail('expected KratyApiError');
+        } on KratyApiError catch (err) {
+          expect(err.status, 429);
+          expect(err.isChatSlowMode, isTrue);
+          expect(err.retryAfterSeconds, inInclusiveRange(39, 40));
+          expect((err.details! as Map)['local'], isTrue);
+        }
+        expect(fake.calls, hasLength(callsBefore));
+        // A server chat_slow_mode 429 feeds the cooldown.
+        await expectLater(kraty.chat.send('d2', 'hey', as: 'alice'), throwsA(isA<KratyApiError>()));
+        expect(kraty.chat.cooldownRemaining('d2'), inInclusiveRange(89, 90));
+        expect(kraty.chat.cooldownRemaining('unknown'), 0);
+        // chat_rate_limited is per player: it doesn't hold the conversation.
+        await expectLater(kraty.chat.send('d3', 'hey', as: 'alice'), throwsA(isA<KratyApiError>()));
+        expect(kraty.chat.cooldownRemaining('d3'), 0);
+        kraty.close();
+      });
+
+      test('typing is skipped in public channels', () async {
+        final fake = FakeClient()
+          ..push(200, body: <String, Object?>{
+            'data': <String, Object?>{'channels': <Object?>[channelConv()]},
+          })
+          ..push(200, body: <String, Object?>{'data': <String, Object?>{'ok': true}});
+        final kraty = Kraty(chatOpts(fake));
+        await kraty.chat.channels(as: 'alice');
+        await kraty.chat.typing(c, as: 'alice');
+        expect(fake.calls, hasLength(1));
+        await kraty.chat.typing('d1', as: 'alice');
+        expect(fake.calls, hasLength(2));
+        expect(fake.calls[1].url, endsWith('/conversations/d1/typing'));
+        kraty.close();
+      });
     });
 
     test('live without channels or a filter choice sends a bare URL', () async {
       final fake = FakeClient()..push(200, body: '');
       final kraty = Kraty(chatOpts(fake));
-      final stream = await kraty.chat.live(as: 'alice');
+      final stream = await kraty.chat.live(as: 'alice', autoReconnect: false);
       await stream.events.toList();
       expect(fake.calls.single.url, '$_baseUrl/sdk/v1/players/alice/chat/stream');
       expect(fake.calls.single.headers.containsKey('x-kraty-chat-filter'), isFalse);

@@ -9,9 +9,10 @@ import 'errors.dart';
 /// (leaderboards, inventory, chat). Parses the `event:` / `data:` line protocol
 /// off a long-lived HTTP response and surfaces one [SseEvent] per event.
 ///
-/// No auto-reconnect on purpose: resumption policy differs per stream and
-/// per game (backoff, whether to re-read state first), so transport
-/// failures land on [SseStream.errors] and the caller decides.
+/// This reader holds ONE connection and never reconnects: transport
+/// failures land on [SseStream.errors]. The `live()` helpers (chat,
+/// leaderboard, inventory) wrap it in a self-healing loop by default
+/// (`reconnecting_sse.dart`).
 
 /// One parsed SSE event: the `event:` name plus the decoded `data:` JSON.
 class SseEvent {
@@ -46,6 +47,8 @@ class SseStream {
 /// the fields we read; `:`-prefixed comment lines are heartbeats and are
 /// ignored. [label] only shapes error messages. [headers] are added to
 /// the request (e.g. the chat stream's `X-Kraty-Chat-Filter`).
+/// [onActivity] fires for every line received, `: ping` comments
+/// included (the reconnecting helpers' heartbeat watchdog uses it).
 Future<SseStream> openSseStream({
   required String baseUrl,
   required String path,
@@ -55,6 +58,7 @@ Future<SseStream> openSseStream({
   required String label,
   String? playerSecret,
   Map<String, String>? headers,
+  void Function()? onActivity,
 }) async {
   final req = http.Request('GET', Uri.parse('$baseUrl$path'));
   req.headers['authorization'] = authHeader;
@@ -92,6 +96,7 @@ Future<SseStream> openSseStream({
       code: (errBody['code'] as String?) ?? 'http_${response.statusCode}',
       message: (errBody['message'] as String?) ?? bodyText,
       details: errBody['details'],
+      retryAfterHeaderSeconds: parseRetryAfterHeader(response.headers['retry-after']),
     );
   }
 
@@ -124,6 +129,7 @@ Future<SseStream> openSseStream({
       .transform(const LineSplitter())
       .listen(
     (line) {
+      onActivity?.call();
       if (line.isEmpty) {
         // Blank line terminates an event.
         emit();

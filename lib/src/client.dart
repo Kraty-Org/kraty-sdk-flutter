@@ -138,6 +138,18 @@ class KratyClientOptions {
   /// conversation kind's default.
   final bool? chatProfanityFilter;
 
+  /// How long a chat send (or edit) keeps retrying through network drops
+  /// and busy servers before it fails with `KratyChatNotSentError`.
+  /// Measured from when the message was queued; time spent waiting out a
+  /// cooldown with [chatWaitForCooldown] doesn't count. Defaults to 120 s.
+  final Duration chatOutboxTimeout;
+
+  /// When true, a chat send made during the conversation's cooldown waits
+  /// in the outbox until the cooldown ends, then goes out. When false (the
+  /// default), it fails at once, locally and without a request, with a
+  /// `chat_slow_mode` [KratyApiError]. Each send can override this.
+  final bool chatWaitForCooldown;
+
   const KratyClientOptions({
     required this.apiKey,
     this.baseUrl = 'https://api.kraty.io',
@@ -153,6 +165,8 @@ class KratyClientOptions {
     this.platform,
     this.appVersion,
     this.chatProfanityFilter,
+    this.chatOutboxTimeout = const Duration(seconds: 120),
+    this.chatWaitForCooldown = false,
   });
 }
 
@@ -217,6 +231,8 @@ class KratyClient {
   // process) is cached for the client's lifetime.
   final String? _platform;
   final bool? _chatProfanityFilter;
+  final Duration _chatOutboxTimeout;
+  final bool _chatWaitForCooldown;
   String? _appVersion;
   Future<String?>? _appVersionProbe;
   // Identity is mutable on purpose: `ensureIdentity()` may register
@@ -252,6 +268,8 @@ class KratyClient {
         _authHeader = 'Bearer ${_validateApiKey(options.apiKey)}',
         _platform = _normalizePlatform(options.platform) ?? _detectPlatform(),
         _chatProfanityFilter = options.chatProfanityFilter,
+        _chatOutboxTimeout = options.chatOutboxTimeout,
+        _chatWaitForCooldown = options.chatWaitForCooldown,
         _appVersion = (options.appVersion?.trim().isEmpty ?? true)
             ? null
             : options.appVersion!.trim(),
@@ -351,6 +369,18 @@ class KratyClient {
   String? get chatFilterValue => _chatProfanityFilter == null
       ? null
       : (_chatProfanityFilter ? 'on' : 'off');
+
+  /// [KratyClientOptions.chatOutboxTimeout].
+  Duration get chatOutboxTimeout => _chatOutboxTimeout;
+
+  /// [KratyClientOptions.chatWaitForCooldown].
+  bool get chatWaitForCooldown => _chatWaitForCooldown;
+
+  /// A fresh idempotency key from the configured generator. Internal: the
+  /// chat outbox stamps one per message so every retry of it carries the
+  /// same key.
+  @internal
+  String nextIdempotencyKey() => _generateIdempotencyKey();
 
   /// The `X-Kraty-Chat-Filter` header the chat resource sends on every
   /// request; empty when [chatFilterValue] is null.
@@ -558,14 +588,21 @@ class KratyClient {
   /// `T` is whatever JSON shape the endpoint returns. Pass
   /// `Map<String, Object?>` and decode manually with the type's
   /// `fromJson` factory. [headers] are added to (and override) the
-  /// SDK's own headers.
+  /// SDK's own headers. [retryOn429] false surfaces a 429 at once instead
+  /// of backing off and retrying (chat sends and edits: a retried refusal
+  /// is another spam strike). [attempts] overrides
+  /// [KratyRetryConfig.attempts] for this call (the chat outbox passes 1
+  /// and runs its own retry loop, so retries don't compound).
   Future<Map<String, Object?>> request({
     required String method,
     required String path,
     Object? body,
     String? idempotencyKeyOverride,
     Map<String, String>? headers,
+    bool retryOn429 = true,
+    int? attempts,
   }) async {
+    final maxAttempts = attempts ?? _retry.attempts;
     final url = '$_baseUrl${path.startsWith('/') ? path : '/$path'}';
     final upperMethod = method.toUpperCase();
     final idempotencyKey = _resolveIdempotencyKey(
@@ -576,7 +613,7 @@ class KratyClient {
     final requestBody = _attachIdempotencyKey(body, idempotencyKey);
 
     Object? lastErr;
-    for (int attempt = 1; attempt <= _retry.attempts; attempt++) {
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
       final sw = Stopwatch()..start();
       try {
         final res = await _fireOnce(upperMethod, url, requestBody, headers)
@@ -611,8 +648,9 @@ class KratyClient {
         }
 
         final apiErr = _asApiError(res);
-        if (_retryableStatuses.contains(res.statusCode) &&
-            attempt < _retry.attempts) {
+        final retryable = _retryableStatuses.contains(res.statusCode) &&
+            !(res.statusCode == 429 && !retryOn429);
+        if (retryable && attempt < maxAttempts) {
           await _sleepBackoff(attempt, res);
           lastErr = apiErr;
           continue;
@@ -636,7 +674,7 @@ class KratyClient {
             err is Error ? err.toString() : err.toString(),
             err,
           );
-          if (attempt < _retry.attempts) {
+          if (attempt < maxAttempts) {
             await _sleepBackoff(attempt, null);
             lastErr = wrapped;
             continue;
@@ -797,12 +835,14 @@ class KratyClient {
       // fall through; we synthesize below
     }
     final env = _tryReadErrorEnvelope(parsed);
+    final retryAfter = parseRetryAfterHeader(res.headers['retry-after']);
     if (env != null) {
       return KratyApiError(
         status: res.statusCode,
         code: env.code,
         message: env.message,
         details: env.details,
+        retryAfterHeaderSeconds: retryAfter,
       );
     }
     return KratyApiError(
@@ -810,6 +850,7 @@ class KratyClient {
       code: KratyErrorCode.internalError,
       message:
           'non-2xx response without an error envelope (status=${res.statusCode})',
+      retryAfterHeaderSeconds: retryAfter,
     );
   }
 }

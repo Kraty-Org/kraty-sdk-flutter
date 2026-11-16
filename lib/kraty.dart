@@ -23,7 +23,9 @@ export 'src/errors.dart' show
     KratyErrorCode,
     KratyErrorPayload,
     KratyNetworkError,
+    KratyChatNotSentError,
     KratyApiErrorIs;
+export 'src/reconnecting_sse.dart' show KratyConnectionEvent, KratyConnectionState;
 export 'src/leaderboard_stream.dart' show LeaderboardStream, LeaderboardStreamEvent;
 export 'src/inventory_stream.dart'
     show InventoryStream, InventoryStreamEvent, InventoryEventOrigin;

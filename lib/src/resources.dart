@@ -3,9 +3,11 @@ import 'dart:math' as math;
 
 import 'chat_stream.dart';
 import 'client.dart';
+import 'errors.dart';
 import 'finalization.dart';
 import 'inventory_stream.dart';
 import 'leaderboard_stream.dart';
+import 'reconnecting_sse.dart';
 import 'types.dart';
 
 /// Helper: unwrap the `{ "data": T }` envelope every SDK endpoint
@@ -431,24 +433,37 @@ class EventLeaderboardsClient {
   ///     soon as this lands without missing the resulting update.
   ///   - `score_update`: a participant's score changed; payload
   ///     carries the new rank/score for the affected entry.
-  ///   - `closed`: server is finalizing or closing. After this,
-  ///     the stream completes and `cancel()` is a no-op.
+  ///   - `closed`: the board ended for good. After this, the stream
+  ///     completes (it never reconnects) and `cancel()` is a no-op.
   ///
-  /// Does NOT auto-reconnect on transport drop; surface errors via
-  /// the returned stream's `errors` and re-call `live()` after a
-  /// backoff if you want resumption.
+  /// Reconnects on its own by default ([autoReconnect]): after a server
+  /// `close` (waits its `retryAfterMs`), a network drop, a busy 503 (waits
+  /// `Retry-After`) or [heartbeatTimeout] of silence (default 40 s; the
+  /// server pings every 15 s; [Duration.zero] turns the watchdog off), with jittered backoff capped at 15 s. No
+  /// replay: watch `connection` and re-read the board on `connected` if
+  /// you need exact standings. Only fatal errors (e.g. 404) land on
+  /// `errors`. A fatal failure of the very first connect throws here.
+  /// Pass `autoReconnect: false` for the old single connection: `errors`
+  /// carries drops and you re-call `live()` yourself.
   ///
   /// Low-level: prefer [subscribe] for game UIs; it polls in the
   /// background so bot scores tick even when no player action would
   /// otherwise trigger a server-side read.
-  Future<LeaderboardStream> live(String leaderboardId) {
+  Future<LeaderboardStream> live(
+    String leaderboardId, {
+    bool autoReconnect = true,
+    Duration heartbeatTimeout = const Duration(seconds: 40),
+  }) {
     return openLeaderboardStream(
       baseUrl: _client.baseUrlForStreaming,
       leaderboardId: leaderboardId,
       authHeader: _client.authHeaderForStreaming,
       httpClient: _client.httpForStreaming,
       playerSecret: _client.playerSecretForStreaming,
+      currentPlayerSecret: () => _client.playerSecretForStreaming,
       sdkUserAgent: _client.sdkUserAgentForStreaming,
+      autoReconnect: autoReconnect,
+      heartbeatTimeout: heartbeatTimeout,
     );
   }
 
@@ -875,11 +890,19 @@ class InventoryClient {
   /// Returns the raw handle; iterate `events` and call `cancel()` when
   /// done. See [watch] for the callback form.
   ///
-  /// Does NOT auto-reconnect: listen on the returned stream's `errors`
-  /// and re-call after a backoff if you need resumption. Treat each event
-  /// as "something changed, re-read this"; the REST reads stay
+  /// Reconnects on its own by default ([autoReconnect]): after a server
+  /// `close`, a network drop, a busy 503 or [heartbeatTimeout] of silence
+  /// (default 40 s; [Duration.zero] turns the watchdog off), with jittered backoff capped at 15 s. No replay:
+  /// watch `connection` and re-read on `connected`. Only fatal errors land
+  /// on `errors`. Pass `autoReconnect: false` for the old single
+  /// connection (`errors` carries drops; re-call after a backoff). Treat
+  /// each event as "something changed, re-read this"; the REST reads stay
   /// authoritative.
-  Future<InventoryStream> live({String? as}) async {
+  Future<InventoryStream> live({
+    String? as,
+    bool autoReconnect = true,
+    Duration heartbeatTimeout = const Duration(seconds: 40),
+  }) async {
     final externalPlayerId = await _resolvePlayerId(_client, as);
     return openInventoryStream(
       baseUrl: _client.baseUrlForStreaming,
@@ -887,7 +910,10 @@ class InventoryClient {
       authHeader: _client.authHeaderForStreaming,
       httpClient: _client.httpForStreaming,
       playerSecret: _client.playerSecretForStreaming,
+      currentPlayerSecret: () => _client.playerSecretForStreaming,
       sdkUserAgent: _client.sdkUserAgentForStreaming,
+      autoReconnect: autoReconnect,
+      heartbeatTimeout: heartbeatTimeout,
     );
   }
 
@@ -907,15 +933,20 @@ class InventoryClient {
   ///
   /// [ignoreOwnWrites] skips events the client itself caused, so a
   /// `consume` doesn't bounce back as a refresh. [onError] receives
-  /// transport failures. Returns a stop function; calling it more than
-  /// once is safe.
+  /// fatal errors (with [autoReconnect], the default) or transport
+  /// failures (without). [onConnection] receives `connected` /
+  /// `reconnecting` status changes. Returns a stop function; calling it
+  /// more than once is safe.
   Future<Future<void> Function()> watch(
     void Function(InventoryStreamEvent event) handler, {
     bool ignoreOwnWrites = false,
     void Function(Object error)? onError,
+    void Function(KratyConnectionEvent event)? onConnection,
+    bool autoReconnect = true,
     String? as,
   }) async {
-    final stream = await live(as: as);
+    final stream = await live(as: as, autoReconnect: autoReconnect);
+    if (onConnection != null) stream.connection.listen(onConnection);
     stream.events.listen(
       (ev) {
         if (ignoreOwnWrites && ev.isOwnWrite) return;
@@ -1370,6 +1401,170 @@ class ChatClient {
 
   ChatClient(this._client);
 
+  /// The server's default per-kind cooldowns, used until [config] is read.
+  static const Map<String, int> _defaultKindCooldowns = {'direct': 1, 'group': 1, 'guild': 2, 'channel': 15};
+
+  /// Per-kind cooldowns from [config].
+  final Map<String, int> _kindCooldowns = Map<String, int>.of(_defaultKindCooldowns);
+
+  /// Kind and channel cooldown of every conversation the SDK has returned.
+  final Map<String, ({String kind, int? channelCooldown})> _known = {};
+
+  /// conversationId → when the player may send there again.
+  final Map<String, DateTime> _readyAt = {};
+
+  /// conversationId → tail of its outbox queue (one send in flight per
+  /// conversation, FIFO).
+  final Map<String, Future<void>> _outboxTails = {};
+
+  final math.Random _jitter = math.Random();
+
+  ChatConversation _observe(ChatConversation c) {
+    _known[c.conversationId] = (kind: c.kind, channelCooldown: c.channel?.cooldownSeconds);
+    return c;
+  }
+
+  void _holdUntil(String conversationId, DateTime at) {
+    final current = _readyAt[conversationId];
+    if (current == null || at.isAfter(current)) _readyAt[conversationId] = at;
+  }
+
+  int _cooldownOf(String conversationId) {
+    final k = _known[conversationId];
+    if (k == null) return 0;
+    return k.channelCooldown ?? _kindCooldowns[k.kind] ?? 0;
+  }
+
+  /// Seconds until the player may send in this conversation again (0 when
+  /// free): from the conversation's cooldown after a successful send, and
+  /// from a `chat_slow_mode` 429's `retryAfterSeconds` (duplicate and
+  /// rate-limit refusals don't hold the conversation). Use it to grey out
+  /// the send button.
+  /// Knows a conversation's cooldown once the SDK has returned it
+  /// ([conversations], [conversation], [channel], …) and [config].
+  int cooldownRemaining(String conversationId) {
+    final at = _readyAt[conversationId];
+    if (at == null) return 0;
+    final left = at.difference(DateTime.now()).inMilliseconds;
+    if (left <= 0) {
+      _readyAt.remove(conversationId);
+      return 0;
+    }
+    return (left / 1000).ceil();
+  }
+
+  /// Runs [job] after every earlier job of [conversationId]'s outbox.
+  Future<T> _enqueue<T>(String conversationId, Future<T> Function() job) {
+    final prev = _outboxTails[conversationId] ?? Future<void>.value();
+    final result = Completer<T>();
+    late final Future<void> tail;
+    tail = prev.then((_) async {
+      try {
+        result.complete(await job());
+      } catch (err, stack) {
+        result.completeError(err, stack);
+      }
+    }).whenComplete(() {
+      if (identical(_outboxTails[conversationId], tail)) _outboxTails.remove(conversationId);
+    });
+    _outboxTails[conversationId] = tail;
+    return result.future;
+  }
+
+  /// At the head of the queue: with the conversation in cooldown, fail
+  /// locally (no request) or, with [wait], hold until it ends. Returns the
+  /// time spent waiting (it doesn't count against the outbox timeout).
+  Future<Duration> _awaitCooldown(String conversationId, bool wait) async {
+    var paused = Duration.zero;
+    while (true) {
+      final at = _readyAt[conversationId];
+      final left = at == null ? Duration.zero : at.difference(DateTime.now());
+      if (left <= Duration.zero) return paused;
+      if (!wait) {
+        final seconds = (left.inMilliseconds / 1000).ceil();
+        throw KratyApiError(
+          status: 429,
+          code: KratyErrorCode.chatSlowMode,
+          message: 'wait ${seconds}s before sending here again',
+          details: <String, Object?>{'retryAfterSeconds': seconds, 'local': true},
+        );
+      }
+      final sw = Stopwatch()..start();
+      await Future<void>.delayed(left);
+      paused += sw.elapsed;
+    }
+  }
+
+  /// Outbox backoff: 500 ms · 2^(n-1) · a random factor in [0.5, 1],
+  /// capped at 10 s.
+  Duration _outboxBackoff(int attempt) {
+    final base = 500 * math.pow(2, math.min(attempt - 1, 10));
+    final ms = math.min(10000, base * (0.5 + _jitter.nextDouble() * 0.5));
+    return Duration(milliseconds: ms.round());
+  }
+
+  static String _fmt(Duration d) =>
+      d.inMilliseconds % 1000 == 0 ? '${d.inSeconds}s' : '${d.inMilliseconds}ms';
+
+  /// A send / edit through the outbox: ONE request per try (the client's
+  /// generic retry loop is bypassed), the same body every time. Network
+  /// errors, timeouts and 5xx (a busy 503 especially) are retried after
+  /// `Retry-After` / `details.retryAfterSeconds`, else jittered backoff,
+  /// until [KratyClientOptions.chatOutboxTimeout] runs out
+  /// ([KratyChatNotSentError]). A 429 or any other 4xx surfaces at once
+  /// (a retried refusal is another spam strike). Only a `chat_slow_mode`
+  /// 429 feeds [cooldownRemaining]: a `chat_duplicate_message` wait is for
+  /// that text only and `chat_rate_limited` is per player, so neither holds
+  /// the conversation.
+  Future<JsonMap> _deliver(
+    String method,
+    String path,
+    String conversationId,
+    Object body, {
+    required String? clientMessageId,
+    required Duration Function() elapsed,
+    required Future<ChatMessage> Function() resend,
+  }) async {
+    final budget = _client.chatOutboxTimeout;
+    var attempt = 0;
+    while (true) {
+      Object lastError;
+      Duration? wait;
+      try {
+        return await _client.request(
+          method: method,
+          path: path,
+          body: body,
+          headers: _client.chatFilterHeaders,
+          retryOn429: false,
+          attempts: 1,
+        );
+      } on KratyApiError catch (err) {
+        if (!isTransientKratyError(err)) {
+          final hold = err.isChatSlowMode ? err.retryAfter : null;
+          if (hold != null) _holdUntil(conversationId, DateTime.now().add(hold));
+          rethrow;
+        }
+        lastError = err;
+        wait = err.retryAfter;
+      } on KratyNetworkError catch (err) {
+        lastError = err;
+      }
+      attempt++;
+      final delay = wait ?? _outboxBackoff(attempt);
+      if (elapsed() + delay >= budget) {
+        throw KratyChatNotSentError(
+          'chat ${clientMessageId == null ? 'edit' : 'message'} not sent within ${_fmt(budget)}: $lastError',
+          conversationId: conversationId,
+          clientMessageId: clientMessageId,
+          lastError: lastError,
+          resend: resend,
+        );
+      }
+      await Future<void>.delayed(delay);
+    }
+  }
+
   Future<String> _base(String? as) async =>
       '/sdk/v1/players/${_enc(await _resolvePlayerId(_client, as))}/chat';
 
@@ -1384,14 +1579,18 @@ class ChatClient {
 
   Future<ChatConversation> _conversation(String method, String path, {Object? body}) async {
     final env = await _call(method, path, body: body);
-    return _data(env, (raw) => ChatConversation.fromJson(_jsonMap(raw)));
+    return _observe(_data(env, (raw) => ChatConversation.fromJson(_jsonMap(raw))));
   }
 
   /// `GET /chat/config`: the game's chat rules, the player's preferences
   /// and their moderation standing.
   Future<ChatClientConfig> config({String? as}) async {
     final env = await _call('GET', '${await _base(as)}/config');
-    return _data(env, (raw) => ChatClientConfig.fromJson(_jsonMap(raw)));
+    final cfg = _data(env, (raw) => ChatClientConfig.fromJson(_jsonMap(raw)));
+    cfg.kinds.forEach((kind, k) {
+      if (k.settings['cooldownSeconds'] is num) _kindCooldowns[kind] = k.cooldownSeconds;
+    });
+    return cfg;
   }
 
   /// `GET /chat/preferences`: the player's saved filter choice and DM policy.
@@ -1430,7 +1629,9 @@ class ChatClient {
       'offset': (offset ?? 0) > 0 ? offset.toString() : null,
     });
     final env = await _call('GET', '${await _base(as)}/conversations$qs');
-    return _data(env, (raw) => ChatConversationPage.fromJson(_jsonMap(raw)));
+    final page = _data(env, (raw) => ChatConversationPage.fromJson(_jsonMap(raw)));
+    page.conversations.forEach(_observe);
+    return page;
   }
 
   /// `GET /chat/unread`: unread totals across the inbox (the badge).
@@ -1512,7 +1713,7 @@ class ChatClient {
   /// `GET /chat/channels`: the game's public channels.
   Future<List<ChatConversation>> channels({String? as}) async {
     final env = await _call('GET', '${await _base(as)}/channels');
-    return _data(env, (raw) => _jsonList(raw, 'channels', ChatConversation.fromJson));
+    return _data(env, (raw) => _jsonList(raw, 'channels', ChatConversation.fromJson)).map(_observe).toList();
   }
 
   /// `GET /chat/channels/:key`: one public channel's conversation.
@@ -1541,27 +1742,65 @@ class ChatClient {
     return _data(env, (raw) => ChatMessagePage.fromJson(_jsonMap(raw)));
   }
 
-  /// `POST /chat/conversations/:id/messages`: send a text message.
-  /// [clientMessageId] defaults to a fresh UUID: reuse it when retrying a
-  /// failed send so the message isn't posted twice, and match it against
-  /// [ChatMessage.clientMessageId] to settle a pending local message.
+  /// `POST /chat/conversations/:id/messages`: send a text message through
+  /// the outbox.
+  ///
+  /// [clientMessageId] defaults to a fresh UUID; [onPending] receives it
+  /// right away (before any request), so the game can show the message as
+  /// pending and match it later against [ChatMessage.clientMessageId] (or
+  /// the stream's [ChatMessageEvent]) to settle it.
+  ///
+  /// The outbox keeps one send in flight per conversation, in call order
+  /// (different conversations run in parallel). Network drops, timeouts
+  /// and busy servers (5xx, 503 especially) are retried on their own with
+  /// the SAME request and `clientMessageId` (never posted twice), until
+  /// [KratyClientOptions.chatOutboxTimeout] (default 120 s, counted from
+  /// this call) runs out: then it throws [KratyChatNotSentError] (a
+  /// [KratyNetworkError]); show "not sent, tap to retry" and call its
+  /// `retry()`. The outbox lives in memory only: nothing survives an app
+  /// restart.
+  ///
+  /// Cooldown: when the message reaches the head of its queue and
+  /// [cooldownRemaining] is above 0, it fails at once, locally and without
+  /// a request, with a 429 `chat_slow_mode` [KratyApiError]
+  /// (`retryAfterSeconds` = the seconds left, `details['local'] == true`).
+  /// With [waitForCooldown] (default
+  /// [KratyClientOptions.chatWaitForCooldown]) it waits out the cooldown
+  /// in the outbox instead, then sends.
+  ///
+  /// Server anti-spam refusals throw at once, never retried: 429
+  /// `chat_slow_mode`, `chat_duplicate_message` or `chat_rate_limited`
+  /// ([KratyApiError.isChatRateLimited], [KratyApiError.retryAfterSeconds]).
+  /// Don't resend before then: repeated refusals mute the player
+  /// automatically (403 `chat_muted`). Other 4xx throw at once too.
   Future<ChatMessage> send(
     String conversationId,
     String text, {
     String? replyToId,
     String? clientMessageId,
+    bool? waitForCooldown,
+    void Function(String clientMessageId)? onPending,
     String? as,
-  }) =>
-      _send(conversationId, as, <String, Object?>{
+  }) {
+    final id = clientMessageId ?? _uuidV4();
+    onPending?.call(id);
+    return _send(
+      conversationId,
+      as,
+      <String, Object?>{
         'type': 'text',
         'text': text,
         if (replyToId != null) 'replyToId': replyToId,
-        'clientMessageId': clientMessageId ?? _uuidV4(),
-      });
+        'clientMessageId': id,
+      },
+      waitForCooldown: waitForCooldown,
+    );
+  }
 
   /// `POST /chat/conversations/:id/messages` with `type: custom`: send a
   /// game card ([customType] declared in the game's config, a JSON
-  /// [payload], optional caption [text]). [clientMessageId] as in [send].
+  /// [payload], optional caption [text]) through the outbox.
+  /// [clientMessageId], [waitForCooldown] and [onPending] as in [send].
   Future<ChatMessage> sendCustom(
     String conversationId,
     String customType,
@@ -1569,20 +1808,54 @@ class ChatClient {
     String? text,
     String? replyToId,
     String? clientMessageId,
+    bool? waitForCooldown,
+    void Function(String clientMessageId)? onPending,
     String? as,
-  }) =>
-      _send(conversationId, as, <String, Object?>{
+  }) {
+    final id = clientMessageId ?? _uuidV4();
+    onPending?.call(id);
+    return _send(
+      conversationId,
+      as,
+      <String, Object?>{
         'type': 'custom',
         'customType': customType,
         if (payload != null) 'payload': payload,
         if (text != null) 'text': text,
         if (replyToId != null) 'replyToId': replyToId,
-        'clientMessageId': clientMessageId ?? _uuidV4(),
-      });
+        'clientMessageId': id,
+      },
+      waitForCooldown: waitForCooldown,
+    );
+  }
 
-  Future<ChatMessage> _send(String conversationId, String? as, Map<String, Object?> body) async {
-    final env = await _call('POST', '${_conv(await _base(as), conversationId)}/messages', body: body);
-    return _data(env, (raw) => ChatMessage.fromJson(_jsonMap(raw)));
+  Future<ChatMessage> _send(
+    String conversationId,
+    String? as,
+    Map<String, Object?> body, {
+    bool? waitForCooldown,
+  }) {
+    final wait = waitForCooldown ?? _client.chatWaitForCooldown;
+    // One idempotency key per message, so every try is the same request.
+    final stamped = body.containsKey('idempotencyKey')
+        ? body
+        : <String, Object?>{...body, 'idempotencyKey': _client.nextIdempotencyKey()};
+    final queued = Stopwatch()..start();
+    return _enqueue(conversationId, () async {
+      final paused = await _awaitCooldown(conversationId, wait);
+      final env = await _deliver(
+        'POST',
+        '${_conv(await _base(as), conversationId)}/messages',
+        conversationId,
+        stamped,
+        clientMessageId: body['clientMessageId'] as String?,
+        elapsed: () => queued.elapsed - paused,
+        resend: () => _send(conversationId, as, stamped, waitForCooldown: waitForCooldown),
+      );
+      final message = _data(env, (raw) => ChatMessage.fromJson(_jsonMap(raw)));
+      _holdUntil(conversationId, DateTime.now().add(Duration(seconds: _cooldownOf(conversationId))));
+      return message;
+    });
   }
 
   /// `PATCH /chat/conversations/:id/messages/:messageId`: edit the text of
@@ -1591,9 +1864,26 @@ class ChatClient {
   /// updated message with [ChatMessage.editedAt] set; live streams get a
   /// [ChatMessageEditedEvent]. Outside the window or on someone else's
   /// message: `403 chat_edit_not_allowed` ([KratyApiError.isChatEditNotAllowed]).
-  Future<ChatMessage> editMessage(String conversationId, String messageId, String text, {String? as}) async {
-    final env = await _call('PATCH', '${_conv(await _base(as), conversationId)}/messages/${_enc(messageId)}',
-        body: <String, Object?>{'text': text});
+  /// Edits count toward the per-minute rate; a 429 throws at once like [send].
+  /// Network drops and busy servers are retried like a send (no queue, no
+  /// cooldown check) until [KratyClientOptions.chatOutboxTimeout], then
+  /// [KratyChatNotSentError] (with a null `clientMessageId`; `retry()`
+  /// makes the same edit again).
+  Future<ChatMessage> editMessage(String conversationId, String messageId, String text, {String? as}) =>
+      _edit(conversationId, messageId, <String, Object?>{'text': text, 'idempotencyKey': _client.nextIdempotencyKey()},
+          as);
+
+  Future<ChatMessage> _edit(String conversationId, String messageId, Map<String, Object?> body, String? as) async {
+    final started = Stopwatch()..start();
+    final env = await _deliver(
+      'PATCH',
+      '${_conv(await _base(as), conversationId)}/messages/${_enc(messageId)}',
+      conversationId,
+      body,
+      clientMessageId: null,
+      elapsed: () => started.elapsed,
+      resend: () => _edit(conversationId, messageId, body, as),
+    );
     return _data(env, (raw) => ChatMessage.fromJson(_jsonMap(raw)));
   }
 
@@ -1615,8 +1905,11 @@ class ChatClient {
   }
 
   /// `POST /chat/conversations/:id/typing`: tell the others you're typing.
-  /// Call at most every few seconds while the player types.
+  /// Call at most every few seconds while the player types. Public channels
+  /// have no typing indicators: for a conversation the SDK knows is a
+  /// channel, nothing is sent.
   Future<void> typing(String conversationId, {String? as}) async {
+    if (_known[conversationId]?.kind == 'channel') return;
     await _call('POST', '${_conv(await _base(as), conversationId)}/typing', body: const <String, Object?>{});
   }
 
@@ -1645,10 +1938,30 @@ class ChatClient {
   /// (at most 10). Iterate `events` (a sealed [ChatStreamEvent] family) and
   /// call `cancel()` when done.
   ///
-  /// Does NOT auto-reconnect: listen on `errors` (and for [ChatCloseEvent]),
-  /// re-call after a backoff, then catch up each conversation with
-  /// [messages] `after:` the last `seq` you saw.
-  Future<ChatStream> live({List<String>? channels, String? as}) async {
+  /// Self-healing by default ([autoReconnect]): after a server `close`
+  /// (waits its `retryAfterMs`), a network drop, a busy 503 (waits
+  /// `Retry-After`) or [heartbeatTimeout] of silence (default 40 s; the
+  /// server pings every 15 s; [Duration.zero] turns the watchdog off) it reconnects with jittered backoff capped at
+  /// 15 s. Once the new connection is `ready`, every followed conversation
+  /// is caught up with [messages] `after:` the last `seq` known (quiet ones
+  /// from [ChatReadyEvent.lastSeqs], ones added meanwhile from 0); the
+  /// missed messages arrive as normal
+  /// [ChatMessageEvent]s before any live event, and no `seq` is ever
+  /// delivered twice. `ChatStream.connection` reports `reconnecting` /
+  /// `connected`; [ChatCloseEvent] isn't delivered; `errors` only carries
+  /// fatal errors (e.g. 403 `chat_disabled`), after which `events` ends.
+  /// A fatal failure of the very first connect throws here; a transient
+  /// one doesn't (the stream starts out `reconnecting`).
+  ///
+  /// `autoReconnect: false` restores the single connection: listen on
+  /// `errors` and for [ChatCloseEvent], re-call after a backoff, then
+  /// catch up each conversation with [messages] `after:` the last `seq`.
+  Future<ChatStream> live({
+    List<String>? channels,
+    String? as,
+    bool autoReconnect = true,
+    Duration heartbeatTimeout = const Duration(seconds: 40),
+  }) async {
     final externalPlayerId = await _resolvePlayerId(_client, as);
     return openChatStream(
       baseUrl: _client.baseUrlForStreaming,
@@ -1656,9 +1969,24 @@ class ChatClient {
       authHeader: _client.authHeaderForStreaming,
       httpClient: _client.httpForStreaming,
       playerSecret: _client.playerSecretForStreaming,
+      currentPlayerSecret: () => _client.playerSecretForStreaming,
       sdkUserAgent: _client.sdkUserAgentForStreaming,
       channels: channels,
       filter: _client.chatFilterValue,
+      autoReconnect: autoReconnect,
+      heartbeatTimeout: heartbeatTimeout,
+      fetchAfter: (conversationId, after) async {
+        final env = await _call(
+            'GET', '${_conv(await _base(externalPlayerId), conversationId)}/messages?after=$after');
+        final data = _jsonMap(env['data']);
+        final list = data['messages'];
+        return (
+          messages: list is List
+              ? list.whereType<Map<Object?, Object?>>().map((m) => m.cast<String, Object?>()).toList()
+              : <Map<String, Object?>>[],
+          hasMore: data['hasMore'] == true,
+        );
+      },
     );
   }
 }

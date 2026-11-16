@@ -3543,8 +3543,21 @@ class ChatChannel {
   /// `players` or `server_only` (announcements: only your backend posts).
   final String postPolicy;
 
-  /// Minimum seconds between two messages from one player; 0 = off.
+  /// The channel's own cooldown; 0 = the channel kind's.
   final int slowModeSeconds;
+
+  /// Seconds a player waits between two messages here: the larger of the
+  /// channel kind's and [slowModeSeconds], never under 15. Sending sooner is
+  /// refused with 429 `chat_slow_mode`.
+  final int cooldownSeconds;
+
+  /// Players per room; null = one room for everyone.
+  final int? roomSize;
+
+  /// The viewer's room (0-based). Big channels split into rooms, each its
+  /// own conversation; the server places players automatically and
+  /// stickily. Announcements reach every room.
+  final int room;
 
   /// Who may post (reading is open); null = everyone.
   final ChatChannelRequirement? requirement;
@@ -3560,6 +3573,9 @@ class ChatChannel {
     required this.description,
     required this.postPolicy,
     required this.slowModeSeconds,
+    this.cooldownSeconds = 15,
+    this.roomSize,
+    this.room = 0,
     required this.requirement,
     required this.metadata,
     this.profanityFilter,
@@ -3573,6 +3589,9 @@ class ChatChannel {
       description: _readNullableString(json, 'description'),
       postPolicy: _readString(json, 'postPolicy'),
       slowModeSeconds: _readInt(json, 'slowModeSeconds'),
+      cooldownSeconds: json['cooldownSeconds'] is num ? _readInt(json, 'cooldownSeconds') : 15,
+      roomSize: _readNullableInt(json, 'roomSize'),
+      room: _readInt(json, 'room'),
       requirement: req == null ? null : ChatChannelRequirement.fromJson(req),
       metadata: _readObjectMap(json, 'metadata'),
       profanityFilter: _readNullableString(json, 'profanityFilter'),
@@ -3798,7 +3817,7 @@ class ChatPreferences {
 }
 
 /// One conversation kind's settings in [ChatClientConfig.kinds].
-/// [enabled] and [profanityFilter] exist on every kind; the rest
+/// [enabled], [profanityFilter] and [cooldownSeconds] exist on every kind; the rest
 /// (`allowFrom`, `maxMembers`, `maxGroupsPerPlayer`, `invitePolicy`, …)
 /// stay in [settings] so new fields reach the game without an SDK update.
 class ChatKindSettings {
@@ -3807,14 +3826,24 @@ class ChatKindSettings {
   /// `always`, `on_by_default` or `off_by_default`.
   final String profanityFilter;
 
+  /// Seconds a player waits between two messages in one conversation of
+  /// this kind (at least 1; 15 for channels).
+  final int cooldownSeconds;
+
   /// Every field the server sent, including [enabled] and [profanityFilter].
   final Map<String, Object?> settings;
 
-  const ChatKindSettings({required this.enabled, required this.profanityFilter, required this.settings});
+  const ChatKindSettings({
+    required this.enabled,
+    required this.profanityFilter,
+    this.cooldownSeconds = 0,
+    required this.settings,
+  });
 
   factory ChatKindSettings.fromJson(JsonMap json) => ChatKindSettings(
         enabled: _readBool(json, 'enabled'),
         profanityFilter: _readString(json, 'profanityFilter'),
+        cooldownSeconds: _readInt(json, 'cooldownSeconds'),
         settings: Map<String, Object?>.unmodifiable(json),
       );
 }
@@ -3865,6 +3894,10 @@ class ChatClientConfig {
 
   /// Messages one player may send per minute, across conversations.
   final int messagesPerMinute;
+
+  /// The same text again in a conversation within this many seconds is
+  /// refused (429 `chat_duplicate_message`); 0 = off.
+  final int duplicateWindowSeconds;
   final ChatPreferences preferences;
   final ModerationStatus status;
 
@@ -3876,6 +3909,7 @@ class ChatClientConfig {
     required this.customTypes,
     this.editWindowSeconds = 0,
     required this.messagesPerMinute,
+    this.duplicateWindowSeconds = 0,
     required this.preferences,
     required this.status,
   });
@@ -3901,6 +3935,7 @@ class ChatClientConfig {
       customTypes: _readList(messages, 'customTypes', ChatCustomType.fromJson),
       editWindowSeconds: _readInt(messages, 'editWindowSeconds'),
       messagesPerMinute: _readInt(rateLimit, 'messagesPerMinute'),
+      duplicateWindowSeconds: _readInt(rateLimit, 'duplicateWindowSeconds'),
       preferences: ChatPreferences.fromJson(_readNullableMap(json, 'preferences') ?? const <String, Object?>{}),
       status: ModerationStatus.fromJson(_readNullableMap(json, 'status') ?? const <String, Object?>{}),
     );

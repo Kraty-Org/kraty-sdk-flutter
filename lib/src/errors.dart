@@ -1,3 +1,5 @@
+import 'types.dart' show ChatMessage;
+
 /// Sealed-ish set of error codes the backend returns. Mirrors
 /// `api/errors.ts` on the backend side. Kept as constants (not an
 /// enum) so the SDK survives the platform adding a new code without
@@ -69,6 +71,9 @@ abstract class KratyErrorCode {
   // ── moderation ───────────────────────────────────────────────────
   static const String cannotReportSelf = 'cannot_report_self';
   static const String reportLimitReached = 'report_limit_reached';
+
+  // ── elastic scaling ──────────────────────────────────────────────
+  static const String serviceUnavailable = 'service_unavailable';
 }
 
 /// Backend error envelope: every non-2xx response (and the special
@@ -99,11 +104,15 @@ class KratyApiError implements Exception {
   final String message;
   final Object? details;
 
+  /// The response's `Retry-After` header in seconds, when it sent one.
+  final double? retryAfterHeaderSeconds;
+
   const KratyApiError({
     required this.status,
     required this.code,
     required this.message,
     this.details,
+    this.retryAfterHeaderSeconds,
   });
 
   /// Generic code matcher. Useful when matching on a code the SDK
@@ -256,11 +265,49 @@ class KratyApiError implements Exception {
   /// (`ChatClientConfig.editWindowSeconds`) has passed or is 0.
   bool get isChatEditNotAllowed => code == KratyErrorCode.chatEditNotAllowed;
 
-  /// 429: too many messages (`chat_rate_limited`) or a channel's slow mode
-  /// (`chat_slow_mode`). `details['retryAfterSeconds']` says when to retry.
+  /// 429: any chat anti-spam refusal: too many messages
+  /// (`chat_rate_limited`), the conversation's cooldown (`chat_slow_mode`)
+  /// or the same text again (`chat_duplicate_message`). [retryAfterSeconds]
+  /// says when to try again. Sends and edits are never auto-retried on
+  /// these: every refusal is a spam strike, and repeated ones mute the
+  /// player automatically ([isChatMuted]).
   bool get isChatRateLimited =>
       code == KratyErrorCode.chatRateLimited ||
-      code == KratyErrorCode.chatSlowMode;
+      code == KratyErrorCode.chatSlowMode ||
+      code == KratyErrorCode.chatDuplicateMessage;
+
+  /// 429: sent again before the conversation's cooldown passed
+  /// (`details['cooldownSeconds']` is the cooldown).
+  bool get isChatSlowMode => code == KratyErrorCode.chatSlowMode;
+
+  /// 429: the same text again in this conversation within the game's
+  /// duplicate window.
+  bool get isChatDuplicateMessage => code == KratyErrorCode.chatDuplicateMessage;
+
+  /// 503: the server is busy (scaling up, or shedding load) and refused
+  /// the request before doing anything. Always safe to retry after
+  /// [retryAfterSeconds]. Chat sends, edits and the SDK's live streams
+  /// already do that on their own, so a game rarely sees this.
+  bool get isServiceUnavailable => code == KratyErrorCode.serviceUnavailable;
+
+  /// Seconds to wait before trying again (`details['retryAfterSeconds']`,
+  /// on the chat 429s and the busy 503, else the `Retry-After` header),
+  /// rounded up, or null when the error carries none.
+  int? get retryAfterSeconds => retryAfter == null ? null : (retryAfter!.inMilliseconds / 1000).ceil();
+
+  /// [retryAfterSeconds] as an exact [Duration], or null when the error
+  /// carries none.
+  Duration? get retryAfter {
+    final d = details;
+    double? seconds;
+    if (d is Map) {
+      final v = d['retryAfterSeconds'];
+      if (v is num) seconds = v.toDouble();
+    }
+    seconds ??= retryAfterHeaderSeconds;
+    if (seconds == null || seconds < 0) return null;
+    return Duration(milliseconds: (seconds * 1000).round());
+  }
 
   @override
   String toString() => 'KratyApiError [$status] $code: $message';
@@ -276,6 +323,67 @@ class KratyNetworkError implements Exception {
 
   @override
   String toString() => 'KratyNetworkError: $message';
+}
+
+/// A chat message (or edit) the SDK could not deliver within
+/// [KratyClientOptions.chatOutboxTimeout] (default 120 s): the network was
+/// down or the servers stayed busy the whole time. Never a refusal (those
+/// throw [KratyApiError]), so nothing was posted and no spam strike was
+/// counted.
+///
+/// Show the message as "not sent, tap to retry" and call [retry] on the
+/// tap: it goes back through the outbox with the SAME [clientMessageId], so
+/// even if an earlier try did reach the server it is never posted twice.
+/// (Calling `chat.send` again passing `clientMessageId:` does the same.)
+/// Extends [KratyNetworkError], so existing network-error handling still
+/// catches it.
+class KratyChatNotSentError extends KratyNetworkError {
+  /// The conversation the message was for.
+  final String conversationId;
+
+  /// The id the message was sent with; null for an edit.
+  final String? clientMessageId;
+
+  /// The last failure seen: a [KratyNetworkError], or a 5xx [KratyApiError].
+  final Object? lastError;
+
+  final Future<ChatMessage> Function() _resend;
+
+  KratyChatNotSentError(
+    String message, {
+    required this.conversationId,
+    required this.clientMessageId,
+    required this.lastError,
+    required Future<ChatMessage> Function() resend,
+  })  : _resend = resend,
+        super(message, lastError);
+
+  /// Sends it again through the outbox (same [clientMessageId]; for an
+  /// edit, the same edit). Completes with the message, or throws like the
+  /// original call.
+  Future<ChatMessage> retry() => _resend();
+
+  @override
+  String toString() => 'KratyChatNotSentError: $message';
+}
+
+/// When a failed request may be retried as-is: a network error or
+/// timeout, a 408, a 429 when [include429] is true, or any 5xx.
+bool isTransientKratyError(Object err, {bool include429 = false}) {
+  if (err is KratyChatNotSentError) return false;
+  if (err is KratyNetworkError) return true;
+  if (err is KratyApiError) {
+    return err.status >= 500 || err.status == 408 || (include429 && err.status == 429);
+  }
+  return false;
+}
+
+/// Parses a `Retry-After` header given in seconds (the HTTP-date form is
+/// ignored).
+double? parseRetryAfterHeader(String? value) {
+  if (value == null) return null;
+  final n = double.tryParse(value.trim());
+  return n != null && n >= 0 ? n : null;
 }
 
 extension KratyApiErrorIs on Object? {
