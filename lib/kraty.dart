@@ -27,18 +27,41 @@ export 'src/errors.dart' show
 export 'src/leaderboard_stream.dart' show LeaderboardStream, LeaderboardStreamEvent;
 export 'src/inventory_stream.dart'
     show InventoryStream, InventoryStreamEvent, InventoryEventOrigin;
+export 'src/chat_stream.dart'
+    show
+        ChatStream,
+        ChatStreamEvent,
+        ChatStreamChannel,
+        ChatReadyEvent,
+        ChatMessageEvent,
+        ChatMessageEditedEvent,
+        ChatMessageDeletedEvent,
+        ChatTypingEvent,
+        ChatReadEvent,
+        ChatConversationAddedEvent,
+        ChatConversationUpdatedEvent,
+        ChatConversationRemovedEvent,
+        ChatRestrictionEvent,
+        ChatRestrictionLiftedEvent,
+        ChatCloseEvent,
+        ChatUnknownEvent;
 export 'src/sse.dart' show SseEvent, SseStream, openSseStream;
 export 'src/resources.dart' show
     CatalogClient,
+    ChatClient,
+    DailyLoginClient,
     CollectAllFailure,
     CollectAllResult,
     EventLeaderboardsClient,
     EventsClient,
     FriendsClient,
     GrantsClient,
+    GuildsClient,
     InventoryClient,
     LeaderboardsClient,
     LobbiesClient,
+    OffersClient,
+    ModerationClient,
     PlayersClient,
     PollLobbyOptions,
     PollPendingGrantsOptions,
@@ -52,9 +75,42 @@ export 'src/types.dart' show
     BoardStandings,
     Catalog,
     CatalogCurrency,
+    CatalogDerivedLevel,
+    CatalogDerivedProgression,
     CatalogItem,
+    ChatChannel,
+    ChatChannelRequirement,
+    ChatClientConfig,
+    ChatConversation,
+    ChatConversationPage,
+    ChatCustomType,
+    ChatKindSettings,
+    ChatMember,
+    ChatMessage,
+    ChatMessagePage,
+    ChatPeer,
+    ChatPlayerRef,
+    ChatPostDenied,
+    ChatPreferences,
+    ChatSender,
+    ChatUnread,
     ConsumeItemInput,
     ConsumeItemResult,
+    DailyLogin,
+    DailyLoginDay,
+    GuildClientConfig,
+    GuildDetail,
+    GuildHelpDonation,
+    GuildHelpOverview,
+    GuildHelpRequest,
+    GuildJoinRequest,
+    GuildJoinResult,
+    GuildLeaveResult,
+    GuildMember,
+    GuildPlayerRef,
+    GuildSearchPage,
+    GuildSummary,
+    MyGuild,
     DebitWalletInput,
     DebitWalletResult,
     EntryCost,
@@ -84,9 +140,23 @@ export 'src/types.dart' show
     LeaderboardReadOptions,
     LeaderboardScoreResult,
     LeaderboardSelf,
+    LeaderboardSummary,
     Lobby,
     MilestoneFired,
     MilestoneRewardPreview,
+    Offer,
+    OfferClaim,
+    OfferClaimResult,
+    OfferFailEventTrigger,
+    OfferImpressionResult,
+    OfferLevelReachedTrigger,
+    OfferPresentation,
+    OfferResourceDepletedTrigger,
+    OfferTier,
+    OfferTriggerInput,
+    OfferTriggerResult,
+    ModerationStatus,
+    MyReport,
     OpenCrateResponse,
     PlayerIdentity,
     PlayerItemHolding,
@@ -94,9 +164,13 @@ export 'src/types.dart' show
     PlayerRegistration,
     PlayerWalletHolding,
     ProgressInput,
+    PurchaseOfferResult,
     ProgressResponse,
     ProgressionBand,
     ProgressionLimits,
+    ReportCategory,
+    ReportContext,
+    Restriction,
     RewardBundlePreview,
     RewardEntryPreview,
     RewardPolicySummary,
@@ -108,7 +182,8 @@ export 'src/types.dart' show
     StandingsSegment,
     Suggestion,
     TrackPurchaseInput,
-    TrackPurchaseResult;
+    TrackPurchaseResult,
+    canonicalTransactionId;
 
 import 'src/client.dart';
 import 'src/finalization.dart';
@@ -165,6 +240,11 @@ class Kraty {
   final PurchasesClient purchases;
   final FriendsClient friends;
   final CatalogClient catalog;
+  final DailyLoginClient dailyLogin;
+  final GuildsClient guilds;
+  final OffersClient offers;
+  final ChatClient chat;
+  final ModerationClient moderation;
 
   Kraty._({
     required this.client,
@@ -179,6 +259,11 @@ class Kraty {
     required this.purchases,
     required this.friends,
     required this.catalog,
+    required this.dailyLogin,
+    required this.guilds,
+    required this.offers,
+    required this.chat,
+    required this.moderation,
   });
 
   factory Kraty(KratyClientOptions options) {
@@ -196,6 +281,11 @@ class Kraty {
       purchases: PurchasesClient(c),
       friends: FriendsClient(c),
       catalog: CatalogClient(c),
+      dailyLogin: DailyLoginClient(c),
+      guilds: GuildsClient(c),
+      offers: OffersClient(c),
+      chat: ChatClient(c),
+      moderation: ModerationClient(c),
     );
   }
 

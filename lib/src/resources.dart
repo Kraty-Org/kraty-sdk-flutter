@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:math' as math;
 
+import 'chat_stream.dart';
 import 'client.dart';
 import 'finalization.dart';
 import 'inventory_stream.dart';
@@ -157,6 +159,22 @@ class LeaderboardsClient {
   final KratyClient _client;
 
   LeaderboardsClient(this._client);
+
+  /// `GET /sdk/v1/leaderboards`: the game's dashboard-configured boards
+  /// (archived ones left out), so the client can discover keys instead of
+  /// hard-coding them.
+  Future<List<LeaderboardSummary>> list() async {
+    final env = await _client.request(method: 'GET', path: '/sdk/v1/leaderboards');
+    return _data<List<LeaderboardSummary>>(env, (raw) {
+      if (raw is List) {
+        return raw
+            .whereType<Map<Object?, Object?>>()
+            .map((e) => LeaderboardSummary.fromJson(e.cast<String, Object?>()))
+            .toList();
+      }
+      return <LeaderboardSummary>[];
+    });
+  }
 
   /// `GET /sdk/v1/leaderboards/:key`: snapshot read of a
   /// dashboard-configured cross-event leaderboard.
@@ -761,13 +779,16 @@ class PurchasesClient {
   ///
   /// ```dart
   /// final result = await kraty.trackPurchase(TrackPurchaseInput(
-  ///   transactionId: tx.purchaseID,
+  ///   // StoreKit 2 transactionId (Google Play: orderId); see canonicalTransactionId.
+  ///   transactionId: tx.purchaseID!,
   ///   store: 'app_store',
   ///   productId: 'gems_500',
   ///   amountMinor: 499, // \$4.99 — minor units, as charged
   ///   currency: 'USD',
   ///   receipt: tx.verificationData.serverVerificationData,
+  ///   offerInstanceId: offer?.instanceId, // when bought from kraty.offers.list()
   /// ));
+  /// // result.offer?.studioFulfils == true → deliver result.offer!.contents yourself
   /// ```
   ///
   /// Throws [KratyApiError] with code `unknown_currency` if Kraty holds
@@ -907,6 +928,804 @@ class InventoryClient {
       stream.errors.listen(onError);
     }
     return stream.cancel;
+  }
+}
+
+/// Resource client for `/sdk/v1/players/:p/daily-login`: the game's daily
+/// login calendar. Read-only; the server pays each day's reward on the
+/// player's first session of that UTC day (a call on first contact or after
+/// 30 minutes of silence opens one), as a grant with
+/// `sourceKind == 'daily_login'`.
+class DailyLoginClient {
+  final KratyClient _client;
+
+  DailyLoginClient(this._client);
+
+  /// `GET /sdk/v1/players/:p/daily-login`. Returns null when the game has no
+  /// calendar or it is switched off for this key's environment. When this
+  /// request is the one that opens a session, today is already paid in the
+  /// result; a player still in a session from before midnight UTC is paid on
+  /// their next one.
+  Future<DailyLogin?> read({String? as}) async {
+    final externalPlayerId = await _resolvePlayerId(_client, as);
+    final env = await _client.request(
+      method: 'GET',
+      path: '/sdk/v1/players/${_enc(externalPlayerId)}/daily-login',
+    );
+    return _data<DailyLogin?>(
+      env,
+      (raw) => raw is Map ? DailyLogin.fromJson(raw.cast<String, Object?>()) : null,
+    );
+  }
+}
+
+/// Resource client for `/sdk/v1/players/:p/offers` (docs/26): real-money
+/// offers such as starter packs, bundles and chains.
+///
+/// The flow: [list] what to show; [markShown] when an offer is actually on
+/// screen (that starts a "from first shown" timer, so don't call it for
+/// offers you only prefetched); sell `offer.current.skus[yourStore]`; then
+/// report the store transaction with `kraty.trackPurchase(TrackPurchaseInput(
+/// …, offerInstanceId: offer.instanceId))`. When the result's
+/// `offer.studioFulfils` is true (the offer is set to game delivers; by default Kraty delivers, so do not grant it too), deliver `offer.contents`
+/// yourself, as you fulfil any IAP.
+class OffersClient {
+  final KratyClient _client;
+
+  OffersClient(this._client);
+
+  Future<String> _base(String? as) async =>
+      '/sdk/v1/players/${_enc(await _resolvePlayerId(_client, as))}/offers';
+
+  static JsonMap _map(Object? raw) => raw is Map ? raw.cast<String, Object?>() : const <String, Object?>{};
+
+  // The client stamps a generated key into a body that has none.
+  static JsonMap _keyBody(String? idempotencyKey) => <String, Object?>{
+        if (idempotencyKey != null && idempotencyKey.isNotEmpty) 'idempotencyKey': idempotencyKey,
+      };
+
+  /// `GET /sdk/v1/players/:p/offers`: the offers to show now, highest
+  /// priority first ([limit] ≤ 20, default 10). [level] is the player's
+  /// current level, for offers that trigger on reaching one. Listing is not
+  /// an impression.
+  Future<List<Offer>> list({int? limit, int? level, String? as}) async {
+    final parts = <String>[
+      if (limit != null) 'limit=$limit',
+      if (level != null) 'level=$level',
+    ];
+    final qs = parts.isEmpty ? '' : '?${parts.join('&')}';
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}$qs');
+    return _data<List<Offer>>(env, (raw) {
+      if (raw is! List) return const <Offer>[];
+      return raw
+          .whereType<Map<Object?, Object?>>()
+          .map((o) => Offer.fromJson(o.cast<String, Object?>()))
+          .toList(growable: false);
+    });
+  }
+
+  /// `POST …/offers/:instanceId/impression`: the offer is on screen now.
+  /// Idempotent (the SDK generates the key when you don't pass one).
+  /// `capped` is true when the offer's impression cap refused it.
+  Future<OfferImpressionResult> markShown(String instanceId, {String? idempotencyKey, String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/${_enc(instanceId)}/impression',
+      body: _keyBody(idempotencyKey),
+    );
+    return _data(env, (raw) => OfferImpressionResult.fromJson(_map(raw)));
+  }
+
+  /// `POST …/offers/:instanceId/dismiss`: the player closed the offer without
+  /// buying. Answers the offer after the dismiss.
+  Future<Offer> dismiss(String instanceId, {String? idempotencyKey, String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/${_enc(instanceId)}/dismiss',
+      body: _keyBody(idempotencyKey),
+    );
+    return _data(env, (raw) => Offer.fromJson(_map(raw)));
+  }
+
+  /// `POST …/offers/triggers`: report a fail, a depleted resource or a level
+  /// ([OfferTriggerInput.failEvent], [OfferTriggerInput.resourceDepleted],
+  /// [OfferTriggerInput.levelReached]) so the offers listening to it arm.
+  /// Answers the newly armed offers that can be shown now (empty when none
+  /// did; they also show up on the next [list]). [playerContext] feeds offer
+  /// eligibility. Idempotent (the SDK generates the key when you don't pass
+  /// one). Win-back offers need no call: they arm when a session opens after
+  /// a break.
+  Future<OfferTriggerResult> trigger(
+    OfferTriggerInput input, {
+    JsonMap? playerContext,
+    String? idempotencyKey,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/triggers',
+      body: <String, Object?>{
+        ..._keyBody(idempotencyKey),
+        'trigger': input.toJson(),
+        if (playerContext != null) 'playerContext': playerContext,
+      },
+    );
+    return _data(env, (raw) => OfferTriggerResult.fromJson(_map(raw)));
+  }
+
+  /// `POST …/offers/:instanceId/claim`: claim the current free tier of a
+  /// chain offer (`offer.current.isFree`). Pass the [tier] the player tapped
+  /// (`offer.tier`). No store, never revenue. Answers the claim and the
+  /// offer after it (the next tier, or `completed`). When
+  /// `claim.studioFulfils` is true (the offer is set to game delivers; by default Kraty delivers, so do not grant it too), deliver `claim.contents`
+  /// yourself. Deliver each claim from one path only (this response or the
+  /// `offer.tier_claimed` webhook), and de-duplicate on `claim.claimId`.
+  /// Idempotent (the SDK generates the key when you don't pass
+  /// one). A refusal throws [KratyApiError] with `code == 'conflict'` and
+  /// `details['reason']` (`tier_changed`, `tier_not_free`, `offer_closed`);
+  /// `details['offer']` is the offer now.
+  Future<OfferClaimResult> claim(
+    String instanceId, {
+    required int tier,
+    String? idempotencyKey,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/${_enc(instanceId)}/claim',
+      body: <String, Object?>{
+        ..._keyBody(idempotencyKey),
+        'tier': tier,
+      },
+    );
+    return _data(env, (raw) => OfferClaimResult.fromJson(_map(raw)));
+  }
+}
+
+/// Resource client for guilds (docs/25): `/sdk/v1/players/:p/guild*` and
+/// `/guilds*`. One guild per player, up to 50 members, leader / co-leader /
+/// member roles. Every call acts as the active player (or [as]). Build
+/// screens from [config]: it carries the unlock gate, the create cost, what
+/// each role may do, and the help and score settings.
+class GuildsClient {
+  final KratyClient _client;
+
+  GuildsClient(this._client);
+
+  Future<String> _base(String? as) async =>
+      '/sdk/v1/players/${_enc(await _resolvePlayerId(_client, as))}';
+
+  static String _query(Map<String, String?> params) {
+    final parts = <String>[
+      for (final e in params.entries)
+        if (e.value != null && e.value!.isNotEmpty) '${e.key}=${Uri.encodeQueryComponent(e.value!)}',
+    ];
+    return parts.isEmpty ? '' : '?${parts.join('&')}';
+  }
+
+  static JsonMap _map(Object? raw) => raw is Map ? raw.cast<String, Object?>() : const <String, Object?>{};
+
+  static List<T> _list<T>(Object? raw, String key, T Function(JsonMap) decode) {
+    final v = _map(raw)[key];
+    if (v is! List) return <T>[];
+    return v
+        .whereType<Map<String, Object?>>()
+        .map((e) => decode(e.cast<String, Object?>()))
+        .toList(growable: false);
+  }
+
+  /// `GET /guilds/config`: the game's guild rules for this player.
+  Future<GuildClientConfig> config({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guilds/config');
+    return _data(env, (raw) => GuildClientConfig.fromJson(_map(raw)));
+  }
+
+  /// `GET /guild`: your guild, role, permissions and week; null when guildless.
+  Future<MyGuild?> mine({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guild');
+    return _data<MyGuild?>(env, (raw) => raw is Map ? MyGuild.fromJson(_map(raw)) : null);
+  }
+
+  /// `GET /guilds/:guildId`: any guild of this game with its roster.
+  Future<GuildDetail> get(String guildId, {String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guilds/${_enc(guildId)}');
+    return _data(env, (raw) => GuildDetail.fromJson(_map(raw)));
+  }
+
+  /// `GET /guilds?q=`: name search, prefix matches first (one page; see [searchPage]).
+  Future<List<GuildSummary>> search(String query, {String? country, int? limit, int? offset, String? as}) async {
+    return (await searchPage(query, country: country, limit: limit, offset: offset, as: as)).guilds;
+  }
+
+  /// `GET /guilds?q=&offset=`: one page of name search (`limit` default 20,
+  /// max 50) and the [GuildSearchPage.nextOffset] for the next (null at the end).
+  Future<GuildSearchPage> searchPage(String query,
+      {String? country, int? limit, int? offset, String? as}) async {
+    final qs = _query({
+      'q': query,
+      'country': country,
+      'limit': limit?.toString(),
+      'offset': (offset ?? 0) > 0 ? offset.toString() : null,
+    });
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guilds$qs');
+    return _data(env, (raw) {
+      final map = _map(raw);
+      final next = map['nextOffset'];
+      return GuildSearchPage(
+        guilds: _list(raw, 'guilds', GuildSummary.fromJson),
+        nextOffset: next is num ? next.toInt() : null,
+      );
+    });
+  }
+
+  /// `GET /guilds/recommended`: guilds with room, friends' guilds first
+  /// ([GuildSummary.friendCount]); varies between calls.
+  Future<List<GuildSummary>> recommended({String? country, int? limit, String? as}) async {
+    final qs = _query({'country': country, 'limit': limit?.toString()});
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guilds/recommended$qs');
+    return _data(env, (raw) => _list(raw, 'guilds', GuildSummary.fromJson));
+  }
+
+  /// `POST /guilds`: found a guild (gate checked, cost charged atomically);
+  /// you lead it. Only non-null fields are sent.
+  Future<MyGuild> create({
+    required String name,
+    String? description,
+    String? badge,
+    String? country,
+    String? joinType,
+    Map<String, Object?>? metadata,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guilds',
+      body: <String, Object?>{
+        'name': name,
+        if (description != null) 'description': description,
+        if (badge != null) 'badge': badge,
+        if (country != null) 'country': country,
+        if (joinType != null) 'joinType': joinType,
+        if (metadata != null) 'metadata': metadata,
+      },
+    );
+    return _data(env, (raw) => MyGuild.fromJson(_map(raw)));
+  }
+
+  /// `POST /guilds/:guildId/join`: join an open guild, or ask to join a request guild.
+  Future<GuildJoinResult> join(String guildId, {String? message, String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guilds/${_enc(guildId)}/join',
+      body: <String, Object?>{if (message != null) 'message': message},
+    );
+    return _data(env, (raw) => GuildJoinResult.fromJson(_map(raw)));
+  }
+
+  /// `GET /guild-requests`: your pending join requests.
+  Future<List<GuildJoinRequest>> myRequests({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guild-requests');
+    return _data(env, (raw) => _list(raw, 'requests', GuildJoinRequest.fromJson));
+  }
+
+  /// `DELETE /guild-requests/:requestId`: withdraw one of your join requests.
+  Future<void> cancelRequest(String requestId, {String? as}) async {
+    await _client.request(method: 'DELETE', path: '${await _base(as)}/guild-requests/${_enc(requestId)}');
+  }
+
+  /// `PATCH /guild`: edit the profile (needs `edit_profile`). Only non-null fields are sent.
+  Future<GuildDetail> updateProfile({
+    String? name,
+    String? description,
+    String? badge,
+    String? country,
+    String? joinType,
+    Map<String, Object?>? metadata,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'PATCH',
+      path: '${await _base(as)}/guild',
+      body: <String, Object?>{
+        if (name != null) 'name': name,
+        if (description != null) 'description': description,
+        if (badge != null) 'badge': badge,
+        if (country != null) 'country': country,
+        if (joinType != null) 'joinType': joinType,
+        if (metadata != null) 'metadata': metadata,
+      },
+    );
+    return _data(env, (raw) => GuildDetail.fromJson(_map(raw)));
+  }
+
+  /// `POST /guild/leave`: a leaving leader hands over; the last one out disbands.
+  Future<GuildLeaveResult> leave({String? as}) async {
+    final env = await _client.request(method: 'POST', path: '${await _base(as)}/guild/leave');
+    return _data(env, (raw) => GuildLeaveResult.fromJson(_map(raw)));
+  }
+
+  /// `GET /guild/requests`: your guild's pending join requests (needs `accept_requests`).
+  Future<List<GuildJoinRequest>> requests({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guild/requests');
+    return _data(env, (raw) => _list(raw, 'requests', GuildJoinRequest.fromJson));
+  }
+
+  /// `POST /guild/requests/:requestId/accept`: the player joins (checks re-run now).
+  Future<GuildDetail> acceptRequest(String requestId, {String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guild/requests/${_enc(requestId)}/accept',
+    );
+    return _data(env, (raw) => GuildDetail.fromJson(_map(raw)));
+  }
+
+  /// `POST /guild/requests/:requestId/decline`.
+  Future<void> declineRequest(String requestId, {String? as}) async {
+    await _client.request(method: 'POST', path: '${await _base(as)}/guild/requests/${_enc(requestId)}/decline');
+  }
+
+  /// `POST /guild/members/:id/kick`: they can't rejoin this guild for the configured block.
+  Future<GuildDetail> kick(String memberExternalId, {String? as}) => _memberAction('kick', memberExternalId, as);
+
+  /// `POST /guild/members/:id/promote`: member → co-leader.
+  Future<GuildDetail> promote(String memberExternalId, {String? as}) =>
+      _memberAction('promote', memberExternalId, as);
+
+  /// `POST /guild/members/:id/demote`: co-leader → member.
+  Future<GuildDetail> demote(String memberExternalId, {String? as}) =>
+      _memberAction('demote', memberExternalId, as);
+
+  Future<GuildDetail> _memberAction(String verb, String memberExternalId, String? as) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guild/members/${_enc(memberExternalId)}/$verb',
+    );
+    return _data(env, (raw) => GuildDetail.fromJson(_map(raw)));
+  }
+
+  /// `POST /guild/leader`: hand leadership to a member (leader only; you become co-leader).
+  Future<GuildDetail> transferLeadership(String memberExternalId, {String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guild/leader',
+      body: <String, Object?>{'externalPlayerId': memberExternalId},
+    );
+    return _data(env, (raw) => GuildDetail.fromJson(_map(raw)));
+  }
+
+  /// `GET /guild/help`: open help requests, yours, and your weekly helps counter.
+  Future<GuildHelpOverview> help({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/guild/help');
+    return _data(env, (raw) => GuildHelpOverview.fromJson(_map(raw)));
+  }
+
+  /// `POST /guild/help`: ask guildmates for a resource on the game's help list.
+  Future<GuildHelpRequest> requestHelp({
+    required String type,
+    required String resourceKey,
+    required int amount,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guild/help',
+      body: <String, Object?>{'type': type, 'resourceKey': resourceKey, 'amount': amount},
+    );
+    return _data(env, (raw) => GuildHelpRequest.fromJson(_map(raw)));
+  }
+
+  /// `POST /guild/help/:requestId/donate`: delivered to them as a grant; may reward you.
+  Future<GuildHelpDonation> donate(String requestId, {int? amount, String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/guild/help/${_enc(requestId)}/donate',
+      body: <String, Object?>{if (amount != null) 'amount': amount},
+    );
+    return _data(env, (raw) => GuildHelpDonation.fromJson(_map(raw)));
+  }
+
+  /// `DELETE /guild/help/:requestId`: withdraw your own help request.
+  Future<GuildHelpRequest> cancelHelp(String requestId, {String? as}) async {
+    final env = await _client.request(method: 'DELETE', path: '${await _base(as)}/guild/help/${_enc(requestId)}');
+    return _data(env, (raw) => GuildHelpRequest.fromJson(_map(raw)));
+  }
+}
+
+/// A random RFC 4122 v4 UUID for `clientMessageId`. Hand-rolled on
+/// `Random.secure()` so the SDK doesn't take a `uuid` dependency.
+String _uuidV4() {
+  final rng = math.Random.secure();
+  final b = List<int>.generate(16, (_) => rng.nextInt(256));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  final hex = b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-'
+      '${hex.substring(16, 20)}-${hex.substring(20)}';
+}
+
+JsonMap _jsonMap(Object? raw) => raw is Map ? raw.cast<String, Object?>() : const <String, Object?>{};
+
+List<T> _jsonList<T>(Object? raw, String key, T Function(JsonMap) decode) {
+  final v = _jsonMap(raw)[key];
+  if (v is! List) return <T>[];
+  return v
+      .whereType<Map<Object?, Object?>>()
+      .map((e) => decode(e.cast<String, Object?>()))
+      .toList(growable: false);
+}
+
+/// Resource client for chat (docs/26): `/sdk/v1/players/:p/chat/*`. Direct
+/// messages, player-made groups, guild chat and the game's public channels.
+/// Every call acts as the active player (or [as]).
+///
+/// Chat is a paid add-on configured per game: when it's off every call
+/// throws `KratyApiError` with `isChatDisabled`. Build screens from
+/// [config]: it carries which kinds are on, the channels, message rules,
+/// the player's preferences and their moderation standing.
+///
+/// When [KratyClientOptions.chatProfanityFilter] is set, every call here
+/// (and [live]) sends `X-Kraty-Chat-Filter: on|off`.
+class ChatClient {
+  final KratyClient _client;
+
+  ChatClient(this._client);
+
+  Future<String> _base(String? as) async =>
+      '/sdk/v1/players/${_enc(await _resolvePlayerId(_client, as))}/chat';
+
+  String _conv(String base, String conversationId) => '$base/conversations/${_enc(conversationId)}';
+
+  Future<JsonMap> _call(String method, String path, {Object? body}) => _client.request(
+        method: method,
+        path: path,
+        body: body,
+        headers: _client.chatFilterHeaders,
+      );
+
+  Future<ChatConversation> _conversation(String method, String path, {Object? body}) async {
+    final env = await _call(method, path, body: body);
+    return _data(env, (raw) => ChatConversation.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /chat/config`: the game's chat rules, the player's preferences
+  /// and their moderation standing.
+  Future<ChatClientConfig> config({String? as}) async {
+    final env = await _call('GET', '${await _base(as)}/config');
+    return _data(env, (raw) => ChatClientConfig.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /chat/preferences`: the player's saved filter choice and DM policy.
+  Future<ChatPreferences> preferences({String? as}) async {
+    final env = await _call('GET', '${await _base(as)}/preferences');
+    return _data(env, (raw) => ChatPreferences.fromJson(_jsonMap(raw)));
+  }
+
+  /// `PUT /chat/preferences`: save the player's choices. Only the fields you
+  /// pass change. [profanityFilter] true / false sets their filter choice;
+  /// [resetProfanityFilter] clears it back to each kind's default.
+  /// [allowDirectFrom] is `everyone`, `friends` or `nobody`.
+  Future<ChatPreferences> setPreferences({
+    bool? profanityFilter,
+    bool resetProfanityFilter = false,
+    String? allowDirectFrom,
+    String? as,
+  }) async {
+    final env = await _call('PUT', '${await _base(as)}/preferences', body: <String, Object?>{
+      if (resetProfanityFilter)
+        'profanityFilter': null
+      else if (profanityFilter != null)
+        'profanityFilter': profanityFilter,
+      if (allowDirectFrom != null) 'allowDirectFrom': allowDirectFrom,
+    });
+    return _data(env, (raw) => ChatPreferences.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /chat/conversations`: the inbox, most recent activity first.
+  /// [kind] narrows it to one kind; page with [limit] (default 30, max 100)
+  /// and the returned [ChatConversationPage.nextOffset].
+  Future<ChatConversationPage> conversations({String? kind, int? limit, int? offset, String? as}) async {
+    final qs = GuildsClient._query({
+      'kind': kind,
+      'limit': limit?.toString(),
+      'offset': (offset ?? 0) > 0 ? offset.toString() : null,
+    });
+    final env = await _call('GET', '${await _base(as)}/conversations$qs');
+    return _data(env, (raw) => ChatConversationPage.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /chat/unread`: unread totals across the inbox (the badge).
+  Future<ChatUnread> unread({String? as}) async {
+    final env = await _call('GET', '${await _base(as)}/unread');
+    return _data(env, (raw) => ChatUnread.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /chat/conversations/:id`: one conversation, with
+  /// [ChatConversation.members] for groups.
+  Future<ChatConversation> conversation(String conversationId, {String? as}) async =>
+      _conversation('GET', _conv(await _base(as), conversationId));
+
+  /// `POST /chat/direct`: open (or reopen) the direct conversation with a
+  /// player, by [externalPlayerId] or [friendCode] (exactly one).
+  Future<ChatConversation> openDirect({String? externalPlayerId, String? friendCode, String? as}) async {
+    if ((externalPlayerId == null) == (friendCode == null)) {
+      throw ArgumentError('openDirect: pass exactly one of externalPlayerId or friendCode');
+    }
+    return _conversation('POST', '${await _base(as)}/direct', body: <String, Object?>{
+      if (externalPlayerId != null) 'externalPlayerId': externalPlayerId,
+      if (friendCode != null) 'friendCode': friendCode,
+    });
+  }
+
+  /// `POST /chat/groups`: create a group; you own it. [externalPlayerIds]
+  /// are added with you (subject to the game's invite policy).
+  Future<ChatConversation> createGroup({
+    required String title,
+    List<String>? externalPlayerIds,
+    Map<String, Object?>? metadata,
+    String? as,
+  }) async =>
+      _conversation('POST', '${await _base(as)}/groups', body: <String, Object?>{
+        'title': title,
+        if (externalPlayerIds != null) 'externalPlayerIds': externalPlayerIds,
+        if (metadata != null) 'metadata': metadata,
+      });
+
+  /// `PATCH /chat/conversations/:id`: rename a group or replace its
+  /// metadata (owner / admin). Only non-null fields are sent.
+  Future<ChatConversation> updateGroup(
+    String conversationId, {
+    String? title,
+    Map<String, Object?>? metadata,
+    String? as,
+  }) async =>
+      _conversation('PATCH', _conv(await _base(as), conversationId), body: <String, Object?>{
+        if (title != null) 'title': title,
+        if (metadata != null) 'metadata': metadata,
+      });
+
+  /// `POST /chat/conversations/:id/members`: add players to a group.
+  Future<ChatConversation> addMembers(String conversationId, List<String> externalPlayerIds, {String? as}) async =>
+      _conversation('POST', '${_conv(await _base(as), conversationId)}/members',
+          body: <String, Object?>{'externalPlayerIds': externalPlayerIds});
+
+  /// `DELETE /chat/conversations/:id/members/:externalPlayerId`: remove a
+  /// member from a group (owner / admin).
+  Future<void> removeMember(String conversationId, String externalPlayerId, {String? as}) async {
+    await _call('DELETE', '${_conv(await _base(as), conversationId)}/members/${_enc(externalPlayerId)}');
+  }
+
+  /// `PUT /chat/conversations/:id/members/:externalPlayerId/role`: set a
+  /// group member's [role] (`owner`, `admin` or `member`).
+  Future<ChatConversation> setRole(String conversationId, String externalPlayerId, String role, {String? as}) async =>
+      _conversation('PUT', '${_conv(await _base(as), conversationId)}/members/${_enc(externalPlayerId)}/role',
+          body: <String, Object?>{'role': role});
+
+  /// `POST /chat/conversations/:id/leave`: leave a group.
+  Future<void> leave(String conversationId, {String? as}) async {
+    await _call('POST', '${_conv(await _base(as), conversationId)}/leave');
+  }
+
+  /// `GET /chat/guild`: your guild's conversation. Throws `conflict` (409)
+  /// when you aren't in a guild.
+  Future<ChatConversation> guild({String? as}) async => _conversation('GET', '${await _base(as)}/guild');
+
+  /// `GET /chat/channels`: the game's public channels.
+  Future<List<ChatConversation>> channels({String? as}) async {
+    final env = await _call('GET', '${await _base(as)}/channels');
+    return _data(env, (raw) => _jsonList(raw, 'channels', ChatConversation.fromJson));
+  }
+
+  /// `GET /chat/channels/:key`: one public channel's conversation.
+  Future<ChatConversation> channel(String key, {String? as}) async =>
+      _conversation('GET', '${await _base(as)}/channels/${_enc(key)}');
+
+  /// `GET /chat/conversations/:id/messages`: a page of messages, oldest →
+  /// newest. No cursor = the latest page; [before] pages back in history;
+  /// [after] catches up (pass the last `seq` you saw). Not both.
+  Future<ChatMessagePage> messages(
+    String conversationId, {
+    int? before,
+    int? after,
+    int? limit,
+    String? as,
+  }) async {
+    if (before != null && after != null) {
+      throw ArgumentError('messages: pass before or after, not both');
+    }
+    final qs = GuildsClient._query({
+      'before': before?.toString(),
+      'after': after?.toString(),
+      'limit': limit?.toString(),
+    });
+    final env = await _call('GET', '${_conv(await _base(as), conversationId)}/messages$qs');
+    return _data(env, (raw) => ChatMessagePage.fromJson(_jsonMap(raw)));
+  }
+
+  /// `POST /chat/conversations/:id/messages`: send a text message.
+  /// [clientMessageId] defaults to a fresh UUID: reuse it when retrying a
+  /// failed send so the message isn't posted twice, and match it against
+  /// [ChatMessage.clientMessageId] to settle a pending local message.
+  Future<ChatMessage> send(
+    String conversationId,
+    String text, {
+    String? replyToId,
+    String? clientMessageId,
+    String? as,
+  }) =>
+      _send(conversationId, as, <String, Object?>{
+        'type': 'text',
+        'text': text,
+        if (replyToId != null) 'replyToId': replyToId,
+        'clientMessageId': clientMessageId ?? _uuidV4(),
+      });
+
+  /// `POST /chat/conversations/:id/messages` with `type: custom`: send a
+  /// game card ([customType] declared in the game's config, a JSON
+  /// [payload], optional caption [text]). [clientMessageId] as in [send].
+  Future<ChatMessage> sendCustom(
+    String conversationId,
+    String customType,
+    Object? payload, {
+    String? text,
+    String? replyToId,
+    String? clientMessageId,
+    String? as,
+  }) =>
+      _send(conversationId, as, <String, Object?>{
+        'type': 'custom',
+        'customType': customType,
+        if (payload != null) 'payload': payload,
+        if (text != null) 'text': text,
+        if (replyToId != null) 'replyToId': replyToId,
+        'clientMessageId': clientMessageId ?? _uuidV4(),
+      });
+
+  Future<ChatMessage> _send(String conversationId, String? as, Map<String, Object?> body) async {
+    final env = await _call('POST', '${_conv(await _base(as), conversationId)}/messages', body: body);
+    return _data(env, (raw) => ChatMessage.fromJson(_jsonMap(raw)));
+  }
+
+  /// `PATCH /chat/conversations/:id/messages/:messageId`: edit the text of
+  /// your own message within the game's edit window
+  /// ([ChatClientConfig.editWindowSeconds]; 0 = editing off). Returns the
+  /// updated message with [ChatMessage.editedAt] set; live streams get a
+  /// [ChatMessageEditedEvent]. Outside the window or on someone else's
+  /// message: `403 chat_edit_not_allowed` ([KratyApiError.isChatEditNotAllowed]).
+  Future<ChatMessage> editMessage(String conversationId, String messageId, String text, {String? as}) async {
+    final env = await _call('PATCH', '${_conv(await _base(as), conversationId)}/messages/${_enc(messageId)}',
+        body: <String, Object?>{'text': text});
+    return _data(env, (raw) => ChatMessage.fromJson(_jsonMap(raw)));
+  }
+
+  /// `DELETE /chat/conversations/:id/messages/:messageId`: delete your own
+  /// message (or any, where [ChatConversation.canModerate]).
+  Future<void> deleteMessage(String conversationId, String messageId, {String? as}) async {
+    await _call('DELETE', '${_conv(await _base(as), conversationId)}/messages/${_enc(messageId)}');
+  }
+
+  /// `POST /chat/conversations/:id/read`: mark read up to [seq]. Returns the
+  /// stored `lastReadSeq` (never moves backwards; clamped to the last message).
+  Future<int> markRead(String conversationId, int seq, {String? as}) async {
+    final env = await _call('POST', '${_conv(await _base(as), conversationId)}/read',
+        body: <String, Object?>{'seq': seq});
+    return _data(env, (raw) {
+      final v = _jsonMap(raw)['lastReadSeq'];
+      return v is num ? v.toInt() : 0;
+    });
+  }
+
+  /// `POST /chat/conversations/:id/typing`: tell the others you're typing.
+  /// Call at most every few seconds while the player types.
+  Future<void> typing(String conversationId, {String? as}) async {
+    await _call('POST', '${_conv(await _base(as), conversationId)}/typing', body: const <String, Object?>{});
+  }
+
+  /// `PUT /chat/conversations/:id/settings`: the player's own settings for
+  /// one conversation. [mutedUntil] silences it (and drops it from
+  /// [unread]) until then; [unmute] clears that. [hidden] hides it from the
+  /// inbox until a new message arrives.
+  Future<ChatConversation> setConversationSettings(
+    String conversationId, {
+    DateTime? mutedUntil,
+    bool unmute = false,
+    bool? hidden,
+    String? as,
+  }) async =>
+      _conversation('PUT', '${_conv(await _base(as), conversationId)}/settings', body: <String, Object?>{
+        if (unmute)
+          'mutedUntil': null
+        else if (mutedUntil != null)
+          'mutedUntil': DateTime.fromMillisecondsSinceEpoch(mutedUntil.millisecondsSinceEpoch, isUtc: true)
+              .toIso8601String(),
+        if (hidden != null) 'hidden': hidden,
+      });
+
+  /// `GET /chat/stream`: the player's live chat feed over SSE. Follows
+  /// every conversation they're in, plus the public [channels] named here
+  /// (at most 10). Iterate `events` (a sealed [ChatStreamEvent] family) and
+  /// call `cancel()` when done.
+  ///
+  /// Does NOT auto-reconnect: listen on `errors` (and for [ChatCloseEvent]),
+  /// re-call after a backoff, then catch up each conversation with
+  /// [messages] `after:` the last `seq` you saw.
+  Future<ChatStream> live({List<String>? channels, String? as}) async {
+    final externalPlayerId = await _resolvePlayerId(_client, as);
+    return openChatStream(
+      baseUrl: _client.baseUrlForStreaming,
+      externalPlayerId: externalPlayerId,
+      authHeader: _client.authHeaderForStreaming,
+      httpClient: _client.httpForStreaming,
+      playerSecret: _client.playerSecretForStreaming,
+      sdkUserAgent: _client.sdkUserAgentForStreaming,
+      channels: channels,
+      filter: _client.chatFilterValue,
+    );
+  }
+}
+
+/// Resource client for player safety (docs/26): reports and the player's
+/// moderation standing. Works in every game, chat add-on or not (store
+/// compliance requires a way to report players).
+class ModerationClient {
+  final KratyClient _client;
+
+  ModerationClient(this._client);
+
+  Future<String> _base(String? as) async =>
+      '/sdk/v1/players/${_enc(await _resolvePlayerId(_client, as))}';
+
+  /// `POST /reports`: report another player. [category] is a
+  /// [ReportCategory] value; [context] a [ReportContext] value (server
+  /// default `other`). For a chat report pass [conversationId] and the
+  /// offending [messageIds] so the reviewer sees the evidence.
+  Future<MyReport> report({
+    required String targetExternalPlayerId,
+    required String category,
+    String? context,
+    String? comment,
+    String? conversationId,
+    List<String>? messageIds,
+    String? guildId,
+    String? as,
+  }) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/reports',
+      body: <String, Object?>{
+        'targetExternalPlayerId': targetExternalPlayerId,
+        'category': category,
+        if (context != null) 'context': context,
+        if (comment != null) 'comment': comment,
+        if (conversationId != null) 'conversationId': conversationId,
+        if (messageIds != null) 'messageIds': messageIds,
+        if (guildId != null) 'guildId': guildId,
+      },
+    );
+    return _data(env, (raw) => MyReport.fromJson(_jsonMap(raw)));
+  }
+
+  /// `GET /reports`: the reports this player filed, newest first.
+  Future<List<MyReport>> reports({int? limit, String? as}) async {
+    final qs = limit == null ? '' : '?limit=$limit';
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/reports$qs');
+    return _data(env, (raw) => _jsonList(raw, 'reports', MyReport.fromJson));
+  }
+
+  /// `GET /moderation/status`: whether the player may chat / post, and the
+  /// restrictions in force (including unacknowledged warnings).
+  Future<ModerationStatus> status({String? as}) async {
+    final env = await _client.request(method: 'GET', path: '${await _base(as)}/moderation/status');
+    return _data(env, (raw) => ModerationStatus.fromJson(_jsonMap(raw)));
+  }
+
+  /// `POST /moderation/warnings/:restrictionId/acknowledge`: the player saw
+  /// the warning; it stops being active.
+  Future<Restriction> acknowledgeWarning(String restrictionId, {String? as}) async {
+    final env = await _client.request(
+      method: 'POST',
+      path: '${await _base(as)}/moderation/warnings/${_enc(restrictionId)}/acknowledge',
+    );
+    return _data(env, (raw) => Restriction.fromJson(_jsonMap(raw)));
   }
 }
 

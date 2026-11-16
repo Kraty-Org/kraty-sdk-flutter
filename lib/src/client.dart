@@ -130,6 +130,14 @@ class KratyClientOptions {
   /// request; set it to override (e.g. to include a build number).
   final String? appVersion;
 
+  /// The game's profanity-filter choice for its player's chat. `true`
+  /// shows the masked copy, `false` shows text as written (on kinds the
+  /// studio didn't set to `always`). When set, every chat request and the
+  /// chat stream carry `X-Kraty-Chat-Filter: on|off`. Leave null (the
+  /// default) to use the player's saved chat preference, then each
+  /// conversation kind's default.
+  final bool? chatProfanityFilter;
+
   const KratyClientOptions({
     required this.apiKey,
     this.baseUrl = 'https://api.kraty.io',
@@ -144,6 +152,7 @@ class KratyClientOptions {
     this.membershipStore,
     this.platform,
     this.appVersion,
+    this.chatProfanityFilter,
   });
 }
 
@@ -207,6 +216,7 @@ class KratyClient {
   // first request awaits the probe; the result (or null in a pure-Dart
   // process) is cached for the client's lifetime.
   final String? _platform;
+  final bool? _chatProfanityFilter;
   String? _appVersion;
   Future<String?>? _appVersionProbe;
   // Identity is mutable on purpose: `ensureIdentity()` may register
@@ -241,6 +251,7 @@ class KratyClient {
         _ownsHttp = options.httpClient == null,
         _authHeader = 'Bearer ${_validateApiKey(options.apiKey)}',
         _platform = _normalizePlatform(options.platform) ?? _detectPlatform(),
+        _chatProfanityFilter = options.chatProfanityFilter,
         _appVersion = (options.appVersion?.trim().isEmpty ?? true)
             ? null
             : options.appVersion!.trim(),
@@ -334,6 +345,19 @@ class KratyClient {
   String? get playerSecretForStreaming => _playerSecret;
   http.Client get httpForStreaming => _http;
   String get sdkUserAgentForStreaming => _sdkUserAgent;
+
+  /// `on` / `off` from [KratyClientOptions.chatProfanityFilter], or null
+  /// when the game left the choice to the player.
+  String? get chatFilterValue => _chatProfanityFilter == null
+      ? null
+      : (_chatProfanityFilter ? 'on' : 'off');
+
+  /// The `X-Kraty-Chat-Filter` header the chat resource sends on every
+  /// request; empty when [chatFilterValue] is null.
+  Map<String, String> get chatFilterHeaders {
+    final v = chatFilterValue;
+    return v == null ? const <String, String>{} : <String, String>{'x-kraty-chat-filter': v};
+  }
 
   /// The active player this client is authenticated as. Resource
   /// methods fall back to this id when the caller omits `as:`.
@@ -533,12 +557,14 @@ class KratyClient {
   ///
   /// `T` is whatever JSON shape the endpoint returns. Pass
   /// `Map<String, Object?>` and decode manually with the type's
-  /// `fromJson` factory.
+  /// `fromJson` factory. [headers] are added to (and override) the
+  /// SDK's own headers.
   Future<Map<String, Object?>> request({
     required String method,
     required String path,
     Object? body,
     String? idempotencyKeyOverride,
+    Map<String, String>? headers,
   }) async {
     final url = '$_baseUrl${path.startsWith('/') ? path : '/$path'}';
     final upperMethod = method.toUpperCase();
@@ -553,7 +579,7 @@ class KratyClient {
     for (int attempt = 1; attempt <= _retry.attempts; attempt++) {
       final sw = Stopwatch()..start();
       try {
-        final res = await _fireOnce(upperMethod, url, requestBody)
+        final res = await _fireOnce(upperMethod, url, requestBody, headers)
             .timeout(_timeout);
         sw.stop();
         _onRequest?.call(KratyRequestInfo(
@@ -647,6 +673,7 @@ class KratyClient {
     String method,
     String url,
     Object? body,
+    Map<String, String>? extraHeaders,
   ) async {
     final secret = _playerSecret;
     final appVersion = await _resolveAppVersion();
@@ -658,6 +685,7 @@ class KratyClient {
       if (appVersion != null) 'x-kraty-app-version': appVersion,
       if (body != null) 'content-type': 'application/json',
       if (secret != null && secret.isNotEmpty) 'x-player-secret': secret,
+      ...?extraHeaders,
     };
     final bodyBytes = body == null ? null : utf8.encode(jsonEncode(body));
     final req = http.Request(method, Uri.parse(url));

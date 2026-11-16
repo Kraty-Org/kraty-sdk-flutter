@@ -43,6 +43,32 @@ abstract class KratyErrorCode {
 
   // ── inventory ────────────────────────────────────────────────────
   static const String inventoryNotPermissive = 'inventory_not_permissive';
+
+  // ── chat (docs/26) ───────────────────────────────────────────────
+  static const String chatDisabled = 'chat_disabled';
+  static const String chatKindDisabled = 'chat_kind_disabled';
+  static const String chatMuted = 'chat_muted';
+  static const String chatBanned = 'chat_banned';
+  static const String chatNewPlayer = 'chat_new_player';
+  static const String playerBanned = 'player_banned';
+  static const String playerBlocked = 'player_blocked';
+  static const String chatDirectNotAllowed = 'chat_direct_not_allowed';
+  static const String chatPostNotAllowed = 'chat_post_not_allowed';
+  static const String chatRequirementNotMet = 'chat_requirement_not_met';
+  static const String chatPermissionDenied = 'chat_permission_denied';
+  static const String chatGroupFull = 'chat_group_full';
+  static const String chatGroupLimit = 'chat_group_limit';
+  static const String chatCannotTargetSelf = 'chat_cannot_target_self';
+  static const String chatMessageInvalid = 'chat_message_invalid';
+  static const String chatMessageRejected = 'chat_message_rejected';
+  static const String chatRateLimited = 'chat_rate_limited';
+  static const String chatSlowMode = 'chat_slow_mode';
+  static const String chatDuplicateMessage = 'chat_duplicate_message';
+  static const String chatEditNotAllowed = 'chat_edit_not_allowed';
+
+  // ── moderation ───────────────────────────────────────────────────
+  static const String cannotReportSelf = 'cannot_report_self';
+  static const String reportLimitReached = 'report_limit_reached';
 }
 
 /// Backend error envelope: every non-2xx response (and the special
@@ -214,6 +240,27 @@ class KratyApiError implements Exception {
   /// backend with a `server_integration` key.
   bool get isInventoryNotPermissive =>
       code == KratyErrorCode.inventoryNotPermissive;
+
+  /// 403: the studio doesn't hold the chat add-on, or the game's chat
+  /// config doesn't serve this environment. Hide the chat UI.
+  bool get isChatDisabled => code == KratyErrorCode.chatDisabled;
+
+  /// 403: the player is muted (`details` carries the restriction). They can
+  /// read but not post until it lapses.
+  bool get isChatMuted => code == KratyErrorCode.chatMuted;
+
+  /// 403: the player is banned from chat.
+  bool get isChatBanned => code == KratyErrorCode.chatBanned;
+
+  /// 403: the message isn't the player's own, or the game's edit window
+  /// (`ChatClientConfig.editWindowSeconds`) has passed or is 0.
+  bool get isChatEditNotAllowed => code == KratyErrorCode.chatEditNotAllowed;
+
+  /// 429: too many messages (`chat_rate_limited`) or a channel's slow mode
+  /// (`chat_slow_mode`). `details['retryAfterSeconds']` says when to retry.
+  bool get isChatRateLimited =>
+      code == KratyErrorCode.chatRateLimited ||
+      code == KratyErrorCode.chatSlowMode;
 
   @override
   String toString() => 'KratyApiError [$status] $code: $message';

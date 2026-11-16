@@ -418,6 +418,22 @@ class EventListing {
   /// always sets it (null maxima when the event caps nothing).
   final AttemptQuota? attemptQuota;
 
+  /// Score that ends a `first_to_score` session: the race's finish
+  /// line. Draw progress toward it; `null` when the event has no such
+  /// target.
+  final int? goal;
+
+  /// Player-condition tree that gates the event's visibility
+  /// ([entryRequirement] gates joining). The server enforces it on
+  /// start; surfaced so the UI can show why an event is locked. `null`
+  /// when there's no gate.
+  final Map<String, Object?>? unlockCondition;
+
+  /// Length of one attempt in seconds. It's also cut short by the window
+  /// end ([endsAt]) and, for session events, by the session ending.
+  /// `null` on backends older than the field.
+  final int? attemptDurationSeconds;
+
   const EventListing({
     required this.eventKey,
     required this.name,
@@ -435,6 +451,9 @@ class EventListing {
     required this.milestoneRewards,
     required this.rewardPolicy,
     required this.attemptQuota,
+    this.goal,
+    this.unlockCondition,
+    this.attemptDurationSeconds,
   });
 
   /// True when [leaderboardMode] is `lobby_matched`. Convenience
@@ -473,6 +492,11 @@ class EventListing {
         attemptQuota: json['attemptQuota'] is Map
             ? AttemptQuota.fromJson((json['attemptQuota']! as Map).cast<String, Object?>())
             : null,
+        goal: _readNullableInt(json, 'goal'),
+        unlockCondition: json['unlockCondition'] is Map
+            ? (json['unlockCondition']! as Map).cast<String, Object?>()
+            : null,
+        attemptDurationSeconds: _readNullableInt(json, 'attemptDurationSeconds'),
       );
 }
 
@@ -521,12 +545,16 @@ class CatalogCurrency {
   final String? iconUrl;
   final Object? description;
   final String kind;
+
+  /// A derived progression item's curve (`level` from `xp`); null otherwise.
+  final CatalogDerivedProgression? derived;
   const CatalogCurrency({
     required this.key,
     required this.name,
     required this.iconUrl,
     required this.description,
     required this.kind,
+    this.derived,
   });
   factory CatalogCurrency.fromJson(JsonMap json) => CatalogCurrency(
         key: _readString(json, 'key'),
@@ -534,7 +562,33 @@ class CatalogCurrency {
         iconUrl: _readNullableString(json, 'iconUrl'),
         description: json['description'],
         kind: _readString(json, 'kind').isEmpty ? 'currency' : _readString(json, 'kind'),
+        derived: json['derived'] is Map
+            ? CatalogDerivedProgression.fromJson((json['derived'] as Map).cast<String, Object?>())
+            : null,
       );
+}
+
+/// Each level of a derived progression item and the source balance that
+/// reaches it, lowest first: draw "120 / 200 XP" without hardcoding levels.
+class CatalogDerivedProgression {
+  final String sourceKey;
+  final List<CatalogDerivedLevel> levels;
+  const CatalogDerivedProgression({required this.sourceKey, required this.levels});
+  factory CatalogDerivedProgression.fromJson(JsonMap json) => CatalogDerivedProgression(
+        sourceKey: _readString(json, 'sourceKey'),
+        levels: ((json['levels'] as List?) ?? const [])
+            .whereType<Map<Object?, Object?>>()
+            .map((e) => CatalogDerivedLevel.fromJson(e.cast<String, Object?>()))
+            .toList(growable: false),
+      );
+}
+
+class CatalogDerivedLevel {
+  final int level;
+  final int sourceRequired;
+  const CatalogDerivedLevel({required this.level, required this.sourceRequired});
+  factory CatalogDerivedLevel.fromJson(JsonMap json) =>
+      CatalogDerivedLevel(level: _readInt(json, 'level'), sourceRequired: _readInt(json, 'sourceRequired'));
 }
 
 class Catalog {
@@ -727,6 +781,54 @@ class EventLeaderboard {
 /// game-scoped `key` (e.g. `"weekly_global"`). The primary surface for
 /// most game UI. For the auto-created per-event-window boards, see
 /// [EventLeaderboard].
+/// One entry of [LeaderboardsClient.list]: a dashboard-configured board
+/// the game can show, so clients discover board keys instead of
+/// hard-coding them.
+class LeaderboardSummary {
+  /// The board's stable game-scoped key; pass it to [LeaderboardsClient.read].
+  final String key;
+
+  /// LocalizedString: a plain string or a locale map (raw JSON value).
+  final Object? name;
+  final String? description;
+
+  /// `daily` | `weekly` | `monthly` | `never`.
+  final String resetCadence;
+
+  /// ISO timestamp the current period ends; `null` when the board never resets.
+  final String? nextResetAt;
+
+  /// `false` when only the studio's server may submit scores to this board.
+  final bool acceptClientScores;
+
+  /// `playerContext` fields that segment the board; pass one's value as
+  /// the segment on read / join / score. Progression segments are
+  /// resolved server-side and aren't listed.
+  final List<String> contextSegments;
+
+  const LeaderboardSummary({
+    required this.key,
+    required this.name,
+    required this.description,
+    required this.resetCadence,
+    required this.nextResetAt,
+    required this.acceptClientScores,
+    required this.contextSegments,
+  });
+
+  factory LeaderboardSummary.fromJson(JsonMap json) => LeaderboardSummary(
+        key: _readString(json, 'key'),
+        name: json['name'],
+        description: _readNullableString(json, 'description'),
+        resetCadence: _readString(json, 'resetCadence'),
+        nextResetAt: _readNullableString(json, 'nextResetAt'),
+        acceptClientScores: _readBool(json, 'acceptClientScores'),
+        contextSegments: ((json['contextSegments'] as List?) ?? const [])
+            .whereType<String>()
+            .toList(growable: false),
+      );
+}
+
 class Leaderboard {
   /// The board's stable game-scoped key.
   final String key;
@@ -1206,6 +1308,79 @@ class PlayerItemHolding {
       );
 }
 
+/// The game's daily login calendar as the player sees it
+/// (`GET /sdk/v1/players/:p/daily-login`). The server pays each day's
+/// reward on the player's first session of that UTC day, as a grant with
+/// `sourceKind == 'daily_login'`; read this to draw the calendar.
+class DailyLogin {
+  /// Day 1 first; each day's reward entries as configured in the dashboard.
+  final List<DailyLoginDay> days;
+
+  /// `restart`, `hold_last` or `stop`: what a streak longer than the calendar does.
+  final String afterLastDay;
+
+  /// Progression item holding [currentDay], for clients already reading the wallet.
+  final String itemKey;
+
+  /// Consecutive UTC days with a session; 0 once a day was missed.
+  final int loginStreak;
+
+  /// Calendar day the player is on (1..days.length); 0 without a streak.
+  final int currentDay;
+
+  /// Whether today's reward has been granted already.
+  final bool paidToday;
+
+  /// The grant that paid today, to match against the grant list or inventory stream.
+  final String? todayGrantId;
+
+  /// ISO start of the next UTC day: when the next day's reward can be earned.
+  final String nextDayAt;
+
+  const DailyLogin({
+    required this.days,
+    required this.afterLastDay,
+    required this.itemKey,
+    required this.loginStreak,
+    required this.currentDay,
+    required this.paidToday,
+    required this.todayGrantId,
+    required this.nextDayAt,
+  });
+
+  factory DailyLogin.fromJson(JsonMap json) => DailyLogin(
+        days: (json['days'] is List ? json['days']! as List : const <Object?>[])
+            .whereType<Map<String, Object?>>()
+            .map((d) => DailyLoginDay.fromJson(d.cast<String, Object?>()))
+            .toList(growable: false),
+        afterLastDay: _readString(json, 'afterLastDay'),
+        itemKey: _readString(json, 'itemKey'),
+        loginStreak: _readInt(json, 'loginStreak'),
+        currentDay: _readInt(json, 'currentDay'),
+        paidToday: _readBool(json, 'paidToday'),
+        todayGrantId: _readNullableString(json, 'todayGrantId'),
+        nextDayAt: _readString(json, 'nextDayAt'),
+      );
+}
+
+/// One day of a [DailyLogin] calendar.
+class DailyLoginDay {
+  final int day;
+
+  /// Reward entries, e.g. `{'type': 'currency', 'currencyKey': 'gems', 'amount': 10}`.
+  final List<Map<String, Object?>> entries;
+
+  const DailyLoginDay({required this.day, required this.entries});
+
+  factory DailyLoginDay.fromJson(JsonMap json) => DailyLoginDay(
+        day: _readInt(json, 'day'),
+        entries: (json['entries'] is List ? json['entries']! as List : const <Object?>[])
+            .whereType<Map<Object?, Object?>>()
+            .map((e) => e.map((k, v) => MapEntry(k as String, v)))
+            .toList(growable: false),
+      );
+}
+
 /// One row in the player's wallet. Wallets are kind-agnostic: a
 /// `gold` currency entry sits beside a `trophies` progression entry
 /// with the same shape. The owning currency's `kind` lives on the
@@ -1321,8 +1496,14 @@ class TrackPurchaseInput {
   /// ISO-8601. Defaults to the server's clock when null.
   final String? purchasedAt;
 
-  /// Arbitrary studio fields: campaign id, offer id, A/B bucket, ….
+  /// Arbitrary studio fields: campaign id, A/B bucket, ….
   final JsonMap? metadata;
+
+  /// The offer this purchase was made from: [Offer.instanceId] from
+  /// `kraty.offers.list()`. Only a purchase carrying it can advance the offer
+  /// (and, when the offer opted in, have Kraty grant its contents); without it
+  /// the SKU is matched for revenue reporting only.
+  final String? offerInstanceId;
 
   const TrackPurchaseInput({
     required this.transactionId,
@@ -1334,6 +1515,7 @@ class TrackPurchaseInput {
     this.receipt,
     this.purchasedAt,
     this.metadata,
+    this.offerInstanceId,
   });
 
   JsonMap toJson() => <String, Object?>{
@@ -1346,6 +1528,7 @@ class TrackPurchaseInput {
         if (receipt != null) 'receipt': receipt,
         if (purchasedAt != null) 'purchasedAt': purchasedAt,
         if (metadata != null) 'metadata': metadata,
+        if (offerInstanceId != null) 'offerInstanceId': offerInstanceId,
       };
 }
 
@@ -1385,6 +1568,11 @@ class TrackPurchaseResult {
   final int lifetimeAmountMinor;
   final int purchaseCount;
 
+  /// The offer this purchase was attributed to, or null. When
+  /// [PurchaseOfferResult.studioFulfils] is true, deliver
+  /// [PurchaseOfferResult.contents] yourself.
+  final PurchaseOfferResult? offer;
+
   const TrackPurchaseResult({
     required this.purchaseId,
     required this.transactionId,
@@ -1402,6 +1590,7 @@ class TrackPurchaseResult {
     required this.lifetimeAmountMinor,
     required this.purchaseCount,
     this.productType,
+    this.offer,
   });
 
   factory TrackPurchaseResult.fromJson(JsonMap json) => TrackPurchaseResult(
@@ -1421,7 +1610,454 @@ class TrackPurchaseResult {
         deduplicated: _readBool(json, 'deduplicated'),
         lifetimeAmountMinor: _readInt(json, 'lifetimeAmountMinor'),
         purchaseCount: _readInt(json, 'purchaseCount'),
+        offer: json['offer'] is Map
+            ? PurchaseOfferResult.fromJson((json['offer']! as Map).cast<String, Object?>())
+            : null,
       );
+}
+
+// ── Offers (docs/26) ──
+
+List<JsonMap> _readEntries(Object? raw) => (raw is List ? raw : const <Object?>[])
+    .whereType<Map<Object?, Object?>>()
+    .map((e) => e.map((k, v) => MapEntry(k as String, v)))
+    .toList(growable: false);
+
+/// One offer instance for the active player (`GET /sdk/v1/players/:p/offers`).
+/// Pass [instanceId] as [TrackPurchaseInput.offerInstanceId] when the player buys.
+class Offer {
+  final String instanceId;
+  final String offerKey;
+
+  /// `bundle`, `starter_pack`, `chain`, `win_back`, `revenge`, `out_of_resource`.
+  final String kind;
+
+  /// A string or a `{ locale: text }` map.
+  final Object? name;
+  final Object? description;
+
+  /// `available`, `shown`, `pending_verification`, `purchased`, `completed`,
+  /// `dismissed`, `expired`.
+  final String state;
+  final int tier;
+  final int tierCount;
+
+  /// What to sell now.
+  final OfferTier current;
+
+  /// Chain offers: the next, still locked tier (a preview); null otherwise.
+  final OfferTier? next;
+
+  /// Server-anchored close time (ISO); the backstop before the first impression.
+  final String? expiresAt;
+
+  /// Chain offers: when the current tier's timer runs out (ISO).
+  final String? tierExpiresAt;
+
+  /// The offer closes when the session ends.
+  final bool endsWithSession;
+  final int? purchasesRemaining;
+  final OfferPresentation presentation;
+
+  /// The A/B variant this player sees ([current], [next] and [presentation]
+  /// already reflect it), for your analytics; null for the base configuration.
+  final String? variantKey;
+
+  /// The linked event's key when the offer is event-linked (a sale while it
+  /// is live, or a post-event offer): show it on that event's screen. Null
+  /// otherwise.
+  final String? linkedEventKey;
+
+  const Offer({
+    required this.instanceId,
+    required this.offerKey,
+    required this.kind,
+    required this.name,
+    required this.description,
+    required this.state,
+    required this.tier,
+    required this.tierCount,
+    required this.current,
+    required this.next,
+    required this.expiresAt,
+    required this.tierExpiresAt,
+    required this.endsWithSession,
+    required this.purchasesRemaining,
+    required this.presentation,
+    this.variantKey,
+    this.linkedEventKey,
+  });
+
+  factory Offer.fromJson(JsonMap json) => Offer(
+        instanceId: _readString(json, 'instanceId'),
+        offerKey: _readString(json, 'offerKey'),
+        kind: _readString(json, 'kind'),
+        name: json['name'],
+        description: json['description'],
+        state: _readString(json, 'state'),
+        tier: _readInt(json, 'tier'),
+        tierCount: _readInt(json, 'tierCount'),
+        current: OfferTier.fromJson(_readNullableMap(json, 'current') ?? const <String, Object?>{}),
+        next: json['next'] is Map ? OfferTier.fromJson(_readNullableMap(json, 'next')!) : null,
+        expiresAt: _readNullableString(json, 'expiresAt'),
+        tierExpiresAt: _readNullableString(json, 'tierExpiresAt'),
+        endsWithSession: _readBool(json, 'endsWithSession'),
+        purchasesRemaining: _readNullableInt(json, 'purchasesRemaining'),
+        presentation: OfferPresentation.fromJson(
+            _readNullableMap(json, 'presentation') ?? const <String, Object?>{}),
+        variantKey: _readNullableString(json, 'variantKey'),
+        linkedEventKey: _readNullableString(json, 'linkedEventKey'),
+      );
+}
+
+/// One purchasable step of an [Offer].
+class OfferTier {
+  final int index;
+
+  /// `paid` (sell it through the store) or `free` (chain offers: claim it
+  /// with [OffersClient.claim], never through a store). Absent on older
+  /// servers, which means paid.
+  final String type;
+
+  /// The store product key; empty for a free tier (the wire sends null).
+  final String storeProductKey;
+
+  /// Store → SKU, e.g. `{'google_play': 'com.game.starter499'}`. Sell the SKU of your store.
+  final Map<String, String> skus;
+
+  /// Reference USD price in cents (display fallback; the store price is what the player pays).
+  final int referencePriceMinor;
+
+  /// Reward entries, e.g. `{'type': 'currency', 'currencyKey': 'gems', 'amount': 500}`.
+  final List<JsonMap> contents;
+  final Object? label;
+  final String? valueLabel;
+
+  const OfferTier({
+    required this.index,
+    this.type = 'paid',
+    required this.storeProductKey,
+    required this.skus,
+    required this.referencePriceMinor,
+    required this.contents,
+    required this.label,
+    required this.valueLabel,
+  });
+
+  factory OfferTier.fromJson(JsonMap json) {
+    final rawSkus = json['skus'];
+    return OfferTier(
+      index: _readInt(json, 'index'),
+      type: json['type'] is String ? json['type']! as String : 'paid',
+      storeProductKey: _readString(json, 'storeProductKey'),
+      skus: <String, String>{
+        if (rawSkus is Map)
+          for (final e in rawSkus.entries)
+            if (e.value is String) '${e.key}': e.value as String,
+      },
+      referencePriceMinor: _readInt(json, 'referencePriceMinor'),
+      contents: _readEntries(json['contents']),
+      label: json['label'],
+      valueLabel: _readNullableString(json, 'valueLabel'),
+    );
+  }
+
+  /// A free tier: claim it with [OffersClient.claim], never through a store.
+  bool get isFree => type == 'free';
+}
+
+/// How the dashboard asked the offer to be drawn. All optional.
+class OfferPresentation {
+  /// `popup`, `banner` or `store_tile`.
+  final String? layout;
+  final String? badge;
+  final String? artKey;
+
+  const OfferPresentation({this.layout, this.badge, this.artKey});
+
+  factory OfferPresentation.fromJson(JsonMap json) => OfferPresentation(
+        layout: _readNullableString(json, 'layout'),
+        badge: _readNullableString(json, 'badge'),
+        artKey: _readNullableString(json, 'artKey'),
+      );
+}
+
+/// Result of `kraty.offers.markShown`.
+class OfferImpressionResult {
+  final Offer offer;
+
+  /// True for the impression that started the offer's timer.
+  final bool firstImpression;
+
+  /// True when a cap refused this impression: don't show the offer.
+  /// Re-rendering an offer already shown this session is never refused by the
+  /// game-wide caps.
+  final bool capped;
+
+  /// Why ([capped] true), else null: `offer_cycle`, `offer_day` (the offer's
+  /// own caps), `global_session`, `global_day`, `global_gap` (the game-wide
+  /// fatigue caps).
+  final String? cappedReason;
+
+  /// When the same impression could succeed (ISO), when known: `global_gap`
+  /// → the last impression + the gap; `global_day` / `offer_day` → the next
+  /// UTC midnight. Null otherwise.
+  final String? retryAt;
+
+  const OfferImpressionResult({
+    required this.offer,
+    required this.firstImpression,
+    required this.capped,
+    this.cappedReason,
+    this.retryAt,
+  });
+
+  factory OfferImpressionResult.fromJson(JsonMap json) => OfferImpressionResult(
+        offer: Offer.fromJson(_readNullableMap(json, 'offer') ?? const <String, Object?>{}),
+        firstImpression: _readBool(json, 'firstImpression'),
+        capped: _readBool(json, 'capped'),
+        cappedReason: _readNullableString(json, 'cappedReason'),
+        retryAt: _readNullableString(json, 'retryAt'),
+      );
+}
+
+/// What `kraty.offers.trigger` reports happened in the game.
+sealed class OfferTriggerInput {
+  const OfferTriggerInput();
+
+  /// A fail ([key], e.g. `level_failed`), with [consecutive] fails in a row
+  /// including this one (default 1). Arms revenge offers.
+  const factory OfferTriggerInput.failEvent(String key, {int? consecutive}) = OfferFailEventTrigger;
+
+  /// The player tried an action needing [required] of [resource] (a currency
+  /// or item key) and has [available]; [secondsToRegen] is when a free refill
+  /// arrives, if one does. Arms top-up offers.
+  const factory OfferTriggerInput.resourceDepleted(
+    String resource, {
+    required int required,
+    required int available,
+    int? secondsToRegen,
+  }) = OfferResourceDepletedTrigger;
+
+  /// The player's level now.
+  const factory OfferTriggerInput.levelReached(int level) = OfferLevelReachedTrigger;
+
+  JsonMap toJson();
+}
+
+class OfferFailEventTrigger extends OfferTriggerInput {
+  final String key;
+  final int? consecutive;
+  const OfferFailEventTrigger(this.key, {this.consecutive});
+
+  @override
+  JsonMap toJson() => <String, Object?>{
+        'type': 'fail_event',
+        'key': key,
+        if (consecutive != null) 'consecutive': consecutive,
+      };
+}
+
+class OfferResourceDepletedTrigger extends OfferTriggerInput {
+  final String resource;
+  final int required;
+  final int available;
+  final int? secondsToRegen;
+  const OfferResourceDepletedTrigger(
+    this.resource, {
+    required this.required,
+    required this.available,
+    this.secondsToRegen,
+  });
+
+  @override
+  JsonMap toJson() => <String, Object?>{
+        'type': 'resource_depleted',
+        'resource': resource,
+        'required': required,
+        'available': available,
+        if (secondsToRegen != null) 'secondsToRegen': secondsToRegen,
+      };
+}
+
+class OfferLevelReachedTrigger extends OfferTriggerInput {
+  final int level;
+  const OfferLevelReachedTrigger(this.level);
+
+  @override
+  JsonMap toJson() => <String, Object?>{'type': 'level_reached', 'level': level};
+}
+
+/// Result of `kraty.offers.trigger`.
+class OfferTriggerResult {
+  /// The offers this trigger armed that can be shown now; empty when none did.
+  final List<Offer> offers;
+
+  const OfferTriggerResult({required this.offers});
+
+  factory OfferTriggerResult.fromJson(JsonMap json) => OfferTriggerResult(
+        offers: (json['offers'] is List ? json['offers']! as List : const <Object?>[])
+            .whereType<Map<Object?, Object?>>()
+            .map((o) => Offer.fromJson(o.cast<String, Object?>()))
+            .toList(growable: false),
+      );
+}
+
+/// One free chain tier claim ([OfferClaimResult.claim]). Exactly one of
+/// [granted] / [studioFulfils] is true: when Kraty granted, the contents
+/// arrive as a grant; otherwise deliver [contents] yourself.
+class OfferClaim {
+  final String claimId;
+  final String offerId;
+  final String offerKey;
+  final String instanceId;
+  final int tier;
+  final List<JsonMap> contents;
+  final bool granted;
+  final String? grantId;
+  final bool studioFulfils;
+  final String claimedAt;
+
+  /// The A/B variant whose contents were claimed; null for the base configuration.
+  final String? variantKey;
+
+  const OfferClaim({
+    required this.claimId,
+    required this.offerId,
+    required this.offerKey,
+    required this.instanceId,
+    required this.tier,
+    required this.contents,
+    required this.granted,
+    required this.grantId,
+    required this.studioFulfils,
+    required this.claimedAt,
+    this.variantKey,
+  });
+
+  factory OfferClaim.fromJson(JsonMap json) => OfferClaim(
+        claimId: _readString(json, 'claimId'),
+        offerId: _readString(json, 'offerId'),
+        offerKey: _readString(json, 'offerKey'),
+        instanceId: _readString(json, 'instanceId'),
+        tier: _readInt(json, 'tier'),
+        contents: _readEntries(json['contents']),
+        granted: _readBool(json, 'granted'),
+        grantId: _readNullableString(json, 'grantId'),
+        studioFulfils: _readBool(json, 'studioFulfils'),
+        claimedAt: _readString(json, 'claimedAt'),
+        variantKey: _readNullableString(json, 'variantKey'),
+      );
+}
+
+/// Result of [OffersClient.claim]: the claim and the offer after it (the
+/// next tier is current with a fresh timer, or the state is `completed`).
+class OfferClaimResult {
+  final OfferClaim claim;
+  final Offer offer;
+
+  const OfferClaimResult({required this.claim, required this.offer});
+
+  factory OfferClaimResult.fromJson(JsonMap json) => OfferClaimResult(
+        claim: OfferClaim.fromJson(
+            json['claim'] is Map ? (json['claim']! as Map).cast<String, Object?>() : const <String, Object?>{}),
+        offer: Offer.fromJson(
+            json['offer'] is Map ? (json['offer']! as Map).cast<String, Object?>() : const <String, Object?>{}),
+      );
+}
+
+/// The offer a purchase was attributed to ([TrackPurchaseResult.offer]).
+class PurchaseOfferResult {
+  final String offerId;
+  final String offerKey;
+  final String? instanceId;
+  final int? tier;
+
+  /// `explicit`: the purchase carried `offerInstanceId`. `inferred`: matched by SKU, revenue only.
+  final String method;
+
+  /// `attributed`, `pending_verification`, `granted`, `refused`, `disputed`, `failed`.
+  final String status;
+
+  /// The instance state after the purchase; null for inferred.
+  final String? state;
+
+  /// Kraty granted the contents (they arrive as a grant).
+  final bool granted;
+
+  /// Kraty will grant once a verified report of the purchase arrives.
+  final bool pendingVerification;
+
+  /// The game delivers [contents] itself (the offer's default).
+  final bool studioFulfils;
+
+  /// What the player bought (explicit only).
+  final List<JsonMap>? contents;
+
+  /// `verified`, `unverified` or `skipped`.
+  final String validationStatus;
+
+  /// The A/B variant whose price and contents were sold; null for the base configuration.
+  final String? variantKey;
+
+  const PurchaseOfferResult({
+    required this.offerId,
+    required this.offerKey,
+    required this.instanceId,
+    required this.tier,
+    required this.method,
+    required this.status,
+    required this.state,
+    required this.granted,
+    required this.pendingVerification,
+    required this.studioFulfils,
+    required this.contents,
+    required this.validationStatus,
+    this.variantKey,
+  });
+
+  factory PurchaseOfferResult.fromJson(JsonMap json) => PurchaseOfferResult(
+        offerId: _readString(json, 'offerId'),
+        offerKey: _readString(json, 'offerKey'),
+        instanceId: _readNullableString(json, 'instanceId'),
+        tier: _readNullableInt(json, 'tier'),
+        method: _readString(json, 'method'),
+        status: _readString(json, 'status'),
+        state: _readNullableString(json, 'state'),
+        granted: _readBool(json, 'granted'),
+        pendingVerification: _readBool(json, 'pendingVerification'),
+        studioFulfils: _readBool(json, 'studioFulfils'),
+        contents: json['contents'] is List ? _readEntries(json['contents']) : null,
+        validationStatus: _readString(json, 'validationStatus'),
+        variantKey: _readNullableString(json, 'variantKey'),
+      );
+}
+
+/// The `transactionId` to report for a store transaction (docs/22, docs/26
+/// § 5.0). Client and server must report the SAME id for one transaction, or
+/// the purchase is recorded twice:
+///
+///  - App Store: the StoreKit 2 `transactionId`, never `originalTransactionId`;
+///  - Google Play: the `orderId` (`GPA.…`), falling back to the
+///    `purchaseToken` only for test purchases that have no `orderId`
+///    (`in_app_purchase`: `GooglePlayPurchaseDetails.billingClientPurchase`);
+///  - other stores: their transaction id, unchanged.
+///
+/// Throws [ArgumentError] when the store's id is missing.
+String canonicalTransactionId({
+  required String store,
+  String? transactionId,
+  String? orderId,
+  String? purchaseToken,
+}) {
+  String? pick(String? v) => v != null && v.isNotEmpty ? v : null;
+  final id = store == 'google_play' ? (pick(orderId) ?? pick(purchaseToken)) : pick(transactionId);
+  if (id == null) {
+    throw ArgumentError(store == 'google_play'
+        ? 'canonicalTransactionId: google_play needs orderId (or purchaseToken for test purchases)'
+        : 'canonicalTransactionId: $store needs transactionId');
+  }
+  return id;
 }
 
 /// Input for `WalletClient.debit`. Same idempotency story as
@@ -2317,5 +2953,1104 @@ class ServerTime {
         timezone: _readString(json, 'timezone'),
         offsetMinutes: _readInt(json, 'offsetMinutes'),
         local: _readString(json, 'local'),
+      );
+}
+
+// ── Guilds (docs/25) ───────────────────────────────────────────────────
+
+List<T> _readList<T>(JsonMap json, String key, T Function(JsonMap) decode) {
+  final v = json[key];
+  if (v is! List) return <T>[];
+  return v
+      .whereType<Map<String, Object?>>()
+      .map((e) => decode(e.cast<String, Object?>()))
+      .toList(growable: false);
+}
+
+JsonMap? _readNullableMap(JsonMap json, String key) {
+  final v = json[key];
+  return v is Map ? v.cast<String, Object?>() : null;
+}
+
+/// Another player as guild screens show them.
+class GuildPlayerRef {
+  final String externalPlayerId;
+  final PlayerIdentity? displayIdentity;
+
+  const GuildPlayerRef({required this.externalPlayerId, required this.displayIdentity});
+
+  factory GuildPlayerRef.fromJson(JsonMap json) => GuildPlayerRef(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+      );
+
+  static GuildPlayerRef? maybe(JsonMap json, String key) {
+    final m = _readNullableMap(json, key);
+    return m == null ? null : GuildPlayerRef.fromJson(m);
+  }
+}
+
+/// A page of [GuildsResource.searchPage] results.
+class GuildSearchPage {
+  final List<GuildSummary> guilds;
+
+  /// Pass as `offset` for the next page; null on the last page.
+  final int? nextOffset;
+  const GuildSearchPage({required this.guilds, this.nextOffset});
+}
+
+/// A guild card: search results and recommendations. Mirrors the OpenAPI
+/// `GuildSummary`, plus [friendCount] on recommendations.
+class GuildSummary {
+  final String guildId;
+  final String name;
+  final String? description;
+
+  /// Free-form key your game maps to emblem art.
+  final String? badge;
+
+  /// ISO-3166-1 alpha-2 country code (`PT`, `US`), or null.
+  final String? country;
+
+  /// `open` or `request`.
+  final String joinType;
+  final int memberCount;
+
+  /// The fixed Kraty limit (50).
+  final int maxMembers;
+  final Map<String, Object?> metadata;
+  final GuildPlayerRef? leader;
+  final String createdAt;
+
+  /// Recommendations only: how many of your friends are in the guild.
+  final int? friendCount;
+
+  const GuildSummary({
+    required this.guildId,
+    required this.name,
+    required this.description,
+    required this.badge,
+    required this.country,
+    required this.joinType,
+    required this.memberCount,
+    required this.maxMembers,
+    required this.metadata,
+    required this.leader,
+    required this.createdAt,
+    this.friendCount,
+  });
+
+  factory GuildSummary.fromJson(JsonMap json) => GuildSummary(
+        guildId: _readString(json, 'guildId'),
+        name: _readString(json, 'name'),
+        description: _readNullableString(json, 'description'),
+        badge: _readNullableString(json, 'badge'),
+        country: _readNullableString(json, 'country'),
+        joinType: _readString(json, 'joinType'),
+        memberCount: _readInt(json, 'memberCount'),
+        maxMembers: _readInt(json, 'maxMembers'),
+        metadata: _readObjectMap(json, 'metadata'),
+        leader: GuildPlayerRef.maybe(json, 'leader'),
+        createdAt: _readString(json, 'createdAt'),
+        friendCount: _readNullableInt(json, 'friendCount'),
+      );
+}
+
+/// One member of a guild roster.
+class GuildMember {
+  final String externalPlayerId;
+  final PlayerIdentity? displayIdentity;
+
+  /// `leader`, `co_leader` or `member`.
+  final String role;
+  final String joinedAt;
+
+  /// Last time the platform saw the player; officers judge activity by it.
+  final String? lastSeenAt;
+  final bool online;
+
+  /// Donations this member made in this guild this guild week.
+  final int weeklyHelps;
+
+  const GuildMember({
+    required this.externalPlayerId,
+    required this.displayIdentity,
+    required this.role,
+    required this.joinedAt,
+    required this.lastSeenAt,
+    required this.online,
+    required this.weeklyHelps,
+  });
+
+  factory GuildMember.fromJson(JsonMap json) => GuildMember(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+        role: _readString(json, 'role'),
+        joinedAt: _readString(json, 'joinedAt'),
+        lastSeenAt: _readNullableString(json, 'lastSeenAt'),
+        online: _readBool(json, 'online'),
+        weeklyHelps: _readInt(json, 'weeklyHelps'),
+      );
+}
+
+/// A guild with its roster (leader first, then co-leaders, members).
+class GuildDetail {
+  final GuildSummary summary;
+  final List<GuildMember> members;
+
+  const GuildDetail({required this.summary, required this.members});
+
+  String get guildId => summary.guildId;
+  String get name => summary.name;
+
+  factory GuildDetail.fromJson(JsonMap json) => GuildDetail(
+        summary: GuildSummary.fromJson(json),
+        members: _readList(json, 'members', GuildMember.fromJson),
+      );
+}
+
+/// Your guild, your role and permissions.
+class MyGuild {
+  final GuildDetail guild;
+
+  /// `leader`, `co_leader` or `member`.
+  final String role;
+  final String joinedAt;
+
+  /// What your role may do in this game (`kick`, `promote`, …).
+  final List<String> permissions;
+
+  const MyGuild({
+    required this.guild,
+    required this.role,
+    required this.joinedAt,
+    required this.permissions,
+  });
+
+  factory MyGuild.fromJson(JsonMap json) {
+    final membership = _readNullableMap(json, 'membership') ?? const <String, Object?>{};
+    return MyGuild(
+      guild: GuildDetail.fromJson(_readNullableMap(json, 'guild') ?? const <String, Object?>{}),
+      role: _readString(membership, 'role'),
+      joinedAt: _readString(membership, 'joinedAt'),
+      permissions: (membership['permissions'] is List
+              ? membership['permissions']! as List
+              : const <Object?>[])
+          .whereType<String>()
+          .toList(growable: false),
+    );
+  }
+}
+
+/// The game's guild rules as this player sees them. Nested settings stay as
+/// JSON maps (`unlock`, `help`, `week`) so new fields reach the game
+/// without an SDK update; the common ones have getters.
+class GuildClientConfig {
+  final int maxMembers;
+  final String defaultJoinType;
+  final Map<String, Object?> roles;
+  final Map<String, Object?> unlock;
+  final List<Map<String, Object?>> createCost;
+
+  /// Who takes [createCost] and donor-paid help from the player: `platform`
+  /// (Kraty debits it) or `studio` (your game manages inventory itself, so
+  /// Kraty charges nothing and you charge the player).
+  final String costsChargedBy;
+  final int leaveCooldownHours;
+  final int kickRejoinBlockHours;
+  final Map<String, Object?> help;
+
+  /// `{ declinedRetryHours, maxPendingPerPlayer, ttlHours }`: a request
+  /// nobody answers expires `ttlHours` after it was made.
+  final Map<String, Object?> joinRequests;
+
+  /// The guild week (the weekly donation cap counts over it).
+  final Map<String, Object?> week;
+
+  const GuildClientConfig({
+    required this.maxMembers,
+    required this.defaultJoinType,
+    required this.roles,
+    required this.unlock,
+    required this.createCost,
+    required this.costsChargedBy,
+    required this.leaveCooldownHours,
+    required this.kickRejoinBlockHours,
+    required this.help,
+    required this.joinRequests,
+    required this.week,
+  });
+
+  /// False until the studio picks an item: then there is no unlock gate.
+  bool get unlockActive => unlock['active'] == true;
+
+  /// Whether this player passes the unlock gate now.
+  bool get eligible => unlock['eligible'] == true;
+
+  factory GuildClientConfig.fromJson(JsonMap json) => GuildClientConfig(
+        maxMembers: _readInt(json, 'maxMembers'),
+        defaultJoinType: _readString(json, 'defaultJoinType'),
+        roles: _readObjectMap(json, 'roles'),
+        unlock: _readObjectMap(json, 'unlock'),
+        createCost: _readList(json, 'createCost', (m) => m),
+        costsChargedBy: _readNullableString(json, 'costsChargedBy') ?? 'platform',
+        leaveCooldownHours: _readInt(json, 'leaveCooldownHours'),
+        kickRejoinBlockHours: _readInt(json, 'kickRejoinBlockHours'),
+        help: _readObjectMap(json, 'help'),
+        joinRequests: _readObjectMap(json, 'joinRequests'),
+        week: _readObjectMap(json, 'week'),
+      );
+}
+
+/// A request to join a `request`-type guild.
+class GuildJoinRequest {
+  final String requestId;
+  final String guildId;
+  final String guildName;
+  final GuildPlayerRef? player;
+  final String? message;
+
+  /// `pending`, `accepted`, `declined`, `cancelled` or `expired`.
+  final String status;
+  final String createdAt;
+  final String? decidedAt;
+
+  const GuildJoinRequest({
+    required this.requestId,
+    required this.guildId,
+    required this.guildName,
+    required this.player,
+    required this.message,
+    required this.status,
+    required this.createdAt,
+    required this.decidedAt,
+  });
+
+  factory GuildJoinRequest.fromJson(JsonMap json) {
+    final guild = _readNullableMap(json, 'guild') ?? const <String, Object?>{};
+    return GuildJoinRequest(
+      requestId: _readString(json, 'requestId'),
+      guildId: _readString(guild, 'guildId'),
+      guildName: _readString(guild, 'name'),
+      player: GuildPlayerRef.maybe(json, 'player'),
+      message: _readNullableString(json, 'message'),
+      status: _readString(json, 'status'),
+      createdAt: _readString(json, 'createdAt'),
+      decidedAt: _readNullableString(json, 'decidedAt'),
+    );
+  }
+}
+
+/// Joined an open guild ([guild]), or a request is waiting ([request]).
+class GuildJoinResult {
+  /// `joined` or `requested`.
+  final String status;
+  final MyGuild? guild;
+  final GuildJoinRequest? request;
+
+  const GuildJoinResult({required this.status, this.guild, this.request});
+
+  factory GuildJoinResult.fromJson(JsonMap json) {
+    final g = _readNullableMap(json, 'guild');
+    final r = _readNullableMap(json, 'request');
+    return GuildJoinResult(
+      status: _readString(json, 'status'),
+      guild: g == null ? null : MyGuild.fromJson(g),
+      request: r == null ? null : GuildJoinRequest.fromJson(r),
+    );
+  }
+}
+
+class GuildLeaveResult {
+  final String guildId;
+
+  /// You were the last member: the guild is gone.
+  final bool disbanded;
+
+  /// Who leads now, when you were the leader.
+  final GuildPlayerRef? newLeader;
+
+  const GuildLeaveResult({required this.guildId, required this.disbanded, required this.newLeader});
+
+  factory GuildLeaveResult.fromJson(JsonMap json) => GuildLeaveResult(
+        guildId: _readString(json, 'guildId'),
+        disbanded: _readBool(json, 'disbanded'),
+        newLeader: GuildPlayerRef.maybe(json, 'newLeader'),
+      );
+}
+
+class GuildHelpRequest {
+  final String requestId;
+  final GuildPlayerRef? requester;
+
+  /// `item` or `currency`.
+  final String type;
+  final String resourceKey;
+  final int amountRequested;
+  final int amountReceived;
+
+  /// `open`, `filled`, `cancelled` or `expired`.
+  final String status;
+  final String createdAt;
+  final String expiresAt;
+  final bool donatedByMe;
+
+  const GuildHelpRequest({
+    required this.requestId,
+    required this.requester,
+    required this.type,
+    required this.resourceKey,
+    required this.amountRequested,
+    required this.amountReceived,
+    required this.status,
+    required this.createdAt,
+    required this.expiresAt,
+    required this.donatedByMe,
+  });
+
+  factory GuildHelpRequest.fromJson(JsonMap json) => GuildHelpRequest(
+        requestId: _readString(json, 'requestId'),
+        requester: GuildPlayerRef.maybe(json, 'requester'),
+        type: _readString(json, 'type'),
+        resourceKey: _readString(json, 'resourceKey'),
+        amountRequested: _readInt(json, 'amountRequested'),
+        amountReceived: _readInt(json, 'amountReceived'),
+        status: _readString(json, 'status'),
+        createdAt: _readString(json, 'createdAt'),
+        expiresAt: _readString(json, 'expiresAt'),
+        donatedByMe: _readBool(json, 'donatedByMe'),
+      );
+}
+
+/// The guild's open help requests, yours, and your weekly helps counter.
+class GuildHelpOverview {
+  final List<GuildHelpRequest> requests;
+  final GuildHelpRequest? myRequest;
+
+  /// When you may ask again (null = now).
+  final String? nextRequestAt;
+  final int donationsMade;
+
+  /// Donations per guild week; null = unlimited.
+  final int? donationLimit;
+
+  const GuildHelpOverview({
+    required this.requests,
+    required this.myRequest,
+    required this.nextRequestAt,
+    required this.donationsMade,
+    required this.donationLimit,
+  });
+
+  factory GuildHelpOverview.fromJson(JsonMap json) {
+    final week = _readNullableMap(json, 'week') ?? const <String, Object?>{};
+    final mine = _readNullableMap(json, 'myRequest');
+    return GuildHelpOverview(
+      requests: _readList(json, 'requests', GuildHelpRequest.fromJson),
+      myRequest: mine == null ? null : GuildHelpRequest.fromJson(mine),
+      nextRequestAt: _readNullableString(json, 'nextRequestAt'),
+      donationsMade: _readInt(week, 'donationsMade'),
+      donationLimit: _readNullableInt(week, 'donationLimit'),
+    );
+  }
+}
+
+class GuildHelpDonation {
+  final String donationId;
+  final String requestId;
+  final int amount;
+
+  /// Grant delivering the donation to the requester.
+  final String grantId;
+
+  /// Your reward grant, when the game pays one.
+  final String? rewardGrantId;
+  final GuildHelpRequest request;
+
+  const GuildHelpDonation({
+    required this.donationId,
+    required this.requestId,
+    required this.amount,
+    required this.grantId,
+    required this.rewardGrantId,
+    required this.request,
+  });
+
+  factory GuildHelpDonation.fromJson(JsonMap json) => GuildHelpDonation(
+        donationId: _readString(json, 'donationId'),
+        requestId: _readString(json, 'requestId'),
+        amount: _readInt(json, 'amount'),
+        grantId: _readString(json, 'grantId'),
+        rewardGrantId: _readNullableString(json, 'rewardGrantId'),
+        request: GuildHelpRequest.fromJson(_readNullableMap(json, 'request') ?? const <String, Object?>{}),
+      );
+}
+
+// ── Chat (docs/26) ─────────────────────────────────────────────────────
+
+/// Another player as chat shows them: the sender of a message, the typer,
+/// a reported player.
+class ChatPlayerRef {
+  final String externalPlayerId;
+
+  /// `{ name, avatar?, country? }`; null when the player never set one.
+  final PlayerIdentity? displayIdentity;
+
+  const ChatPlayerRef({required this.externalPlayerId, required this.displayIdentity});
+
+  factory ChatPlayerRef.fromJson(JsonMap json) => ChatPlayerRef(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+      );
+
+  static ChatPlayerRef? maybe(JsonMap json, String key) {
+    final m = _readNullableMap(json, key);
+    return m == null ? null : ChatPlayerRef.fromJson(m);
+  }
+}
+
+/// The other player of a `direct` conversation, with live presence.
+class ChatPeer {
+  final String externalPlayerId;
+  final PlayerIdentity? displayIdentity;
+  final bool online;
+
+  const ChatPeer({required this.externalPlayerId, required this.displayIdentity, required this.online});
+
+  factory ChatPeer.fromJson(JsonMap json) => ChatPeer(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+        online: _readBool(json, 'online'),
+      );
+}
+
+/// Who wrote a message.
+class ChatSender {
+  /// `player`, `server` (your backend) or `system` (Kraty).
+  final String kind;
+
+  /// The player for `player` messages; null otherwise.
+  final ChatPlayerRef? player;
+
+  const ChatSender({required this.kind, required this.player});
+
+  factory ChatSender.fromJson(JsonMap json) => ChatSender(
+        kind: _readString(json, 'kind'),
+        player: ChatPlayerRef.maybe(json, 'player'),
+      );
+}
+
+/// One chat message, resolved for the viewer (their profanity-filter
+/// choice already applied to [text]).
+class ChatMessage {
+  final String messageId;
+  final String conversationId;
+
+  /// Position in the conversation: gapless and ascending. The cursor for
+  /// `messages(before:/after:)` and `markRead`.
+  final int seq;
+
+  /// `text`, `custom` (a game card: [customType] + [payload], optional
+  /// caption [text]) or `system` (written by Kraty: [customType] is the
+  /// event, e.g. `member_joined`, [payload] its data, [text] an English
+  /// fallback). Treat unknown values as an open set.
+  final String type;
+  final ChatSender sender;
+
+  /// What this viewer sees; null for a deleted message or a payload-only card.
+  final String? text;
+
+  /// [text] is the profanity-filtered copy (it differs from what was written).
+  final bool filtered;
+  final String? customType;
+
+  /// The card payload (`custom`) or the event data (`system`): free-form JSON.
+  final Object? payload;
+  final String? replyToId;
+
+  /// Echoed back to the sender only, to match a pending local message.
+  final String? clientMessageId;
+  final String createdAt;
+
+  /// When the sender last edited it (ISO 8601); null = never edited.
+  final String? editedAt;
+  final bool deleted;
+
+  const ChatMessage({
+    required this.messageId,
+    required this.conversationId,
+    required this.seq,
+    required this.type,
+    required this.sender,
+    required this.text,
+    required this.filtered,
+    required this.customType,
+    required this.payload,
+    required this.replyToId,
+    required this.clientMessageId,
+    required this.createdAt,
+    this.editedAt,
+    required this.deleted,
+  });
+
+  /// Whether the sender edited it after sending.
+  bool get edited => editedAt != null;
+
+  /// [payload] as a JSON object, or null when it isn't one.
+  Map<String, Object?>? get payloadMap {
+    final p = payload;
+    return p is Map ? p.cast<String, Object?>() : null;
+  }
+
+  factory ChatMessage.fromJson(JsonMap json) => ChatMessage(
+        messageId: _readString(json, 'messageId'),
+        conversationId: _readString(json, 'conversationId'),
+        seq: _readInt(json, 'seq'),
+        type: _readString(json, 'type'),
+        sender: ChatSender.fromJson(_readNullableMap(json, 'sender') ?? const <String, Object?>{}),
+        text: _readNullableString(json, 'text'),
+        filtered: _readBool(json, 'filtered'),
+        customType: _readNullableString(json, 'customType'),
+        payload: json['payload'],
+        replyToId: _readNullableString(json, 'replyToId'),
+        clientMessageId: _readNullableString(json, 'clientMessageId'),
+        createdAt: _readString(json, 'createdAt'),
+        editedAt: _readNullableString(json, 'editedAt'),
+        deleted: _readBool(json, 'deleted'),
+      );
+}
+
+/// A channel's posting gate on a progression item (level, trophies…).
+class ChatChannelRequirement {
+  final String itemKey;
+  final int threshold;
+
+  const ChatChannelRequirement({required this.itemKey, required this.threshold});
+
+  factory ChatChannelRequirement.fromJson(JsonMap json) => ChatChannelRequirement(
+        itemKey: _readString(json, 'itemKey'),
+        threshold: _readInt(json, 'threshold'),
+      );
+}
+
+/// A public channel the studio defined (global, a language, trading…).
+class ChatChannel {
+  /// Stable id the game addresses (`global`, `es`, `trade`).
+  final String key;
+  final String name;
+  final String? description;
+
+  /// `players` or `server_only` (announcements: only your backend posts).
+  final String postPolicy;
+
+  /// Minimum seconds between two messages from one player; 0 = off.
+  final int slowModeSeconds;
+
+  /// Who may post (reading is open); null = everyone.
+  final ChatChannelRequirement? requirement;
+  final Map<String, Object?> metadata;
+
+  /// `always`, `on_by_default` or `off_by_default`. Only on
+  /// [ChatClientConfig.channels]; null on a conversation's channel.
+  final String? profanityFilter;
+
+  const ChatChannel({
+    required this.key,
+    required this.name,
+    required this.description,
+    required this.postPolicy,
+    required this.slowModeSeconds,
+    required this.requirement,
+    required this.metadata,
+    this.profanityFilter,
+  });
+
+  factory ChatChannel.fromJson(JsonMap json) {
+    final req = _readNullableMap(json, 'requirement');
+    return ChatChannel(
+      key: _readString(json, 'key'),
+      name: _readString(json, 'name'),
+      description: _readNullableString(json, 'description'),
+      postPolicy: _readString(json, 'postPolicy'),
+      slowModeSeconds: _readInt(json, 'slowModeSeconds'),
+      requirement: req == null ? null : ChatChannelRequirement.fromJson(req),
+      metadata: _readObjectMap(json, 'metadata'),
+      profanityFilter: _readNullableString(json, 'profanityFilter'),
+    );
+  }
+}
+
+/// Why the viewer can't post in a conversation (blocked, friends only,
+/// requirement not met, announcements channel…). Same shape as an API error.
+class ChatPostDenied {
+  final String code;
+  final String message;
+  final Map<String, Object?>? details;
+
+  const ChatPostDenied({required this.code, required this.message, this.details});
+
+  factory ChatPostDenied.fromJson(JsonMap json) => ChatPostDenied(
+        code: _readString(json, 'code'),
+        message: _readString(json, 'message'),
+        details: _readNullableMap(json, 'details'),
+      );
+}
+
+/// One member of a group (or other explicit-membership) conversation.
+class ChatMember {
+  final String externalPlayerId;
+  final PlayerIdentity? displayIdentity;
+
+  /// `owner`, `admin` or `member` in a group; the guild role in guild chat.
+  final String role;
+  final String joinedAt;
+  final bool online;
+
+  const ChatMember({
+    required this.externalPlayerId,
+    required this.displayIdentity,
+    required this.role,
+    required this.joinedAt,
+    required this.online,
+  });
+
+  factory ChatMember.fromJson(JsonMap json) => ChatMember(
+        externalPlayerId: _readString(json, 'externalPlayerId'),
+        displayIdentity: _readIdentity(json, 'displayIdentity'),
+        role: _readString(json, 'role'),
+        joinedAt: _readString(json, 'joinedAt'),
+        online: _readBool(json, 'online'),
+      );
+}
+
+/// A conversation as the viewer sees it: a direct chat, a group, the
+/// guild's chat or a public channel.
+class ChatConversation {
+  final String conversationId;
+
+  /// `direct`, `group`, `guild` or `channel`; an open set.
+  final String kind;
+
+  /// Group title, guild name, channel name; null for `direct` (show [peer]).
+  final String? title;
+  final Map<String, Object?> metadata;
+  final int memberCount;
+  final int lastSeq;
+  final String? lastMessageAt;
+  final ChatMessage? lastMessage;
+  final int unreadCount;
+  final int lastReadSeq;
+
+  /// Notifications muted by the player until then (their choice, not a
+  /// moderation mute).
+  final String? mutedUntil;
+
+  /// `direct`: the other player.
+  final ChatPeer? peer;
+
+  /// `guild`: the guild.
+  final String? guildId;
+
+  /// `channel`: the channel definition.
+  final ChatChannel? channel;
+
+  /// The viewer's role here (group / guild role), or null.
+  final String? role;
+  final bool canPost;
+
+  /// Why [canPost] is false; null when it's true.
+  final ChatPostDenied? postDenied;
+
+  /// The viewer may delete other players' messages here.
+  final bool canModerate;
+
+  /// The profanity mode in force: `always`, `on_by_default`, `off_by_default`.
+  final String filterMode;
+  final String createdAt;
+
+  /// The roster. Only on single-conversation reads of explicit-membership
+  /// kinds (`conversation`, `createGroup`, `updateGroup`, `addMembers`,
+  /// `setRole`); null elsewhere.
+  final List<ChatMember>? members;
+
+  const ChatConversation({
+    required this.conversationId,
+    required this.kind,
+    required this.title,
+    required this.metadata,
+    required this.memberCount,
+    required this.lastSeq,
+    required this.lastMessageAt,
+    required this.lastMessage,
+    required this.unreadCount,
+    required this.lastReadSeq,
+    required this.mutedUntil,
+    required this.peer,
+    required this.guildId,
+    required this.channel,
+    required this.role,
+    required this.canPost,
+    required this.postDenied,
+    required this.canModerate,
+    required this.filterMode,
+    required this.createdAt,
+    this.members,
+  });
+
+  factory ChatConversation.fromJson(JsonMap json) {
+    final last = _readNullableMap(json, 'lastMessage');
+    final peer = _readNullableMap(json, 'peer');
+    final channel = _readNullableMap(json, 'channel');
+    final denied = _readNullableMap(json, 'postDenied');
+    return ChatConversation(
+      conversationId: _readString(json, 'conversationId'),
+      kind: _readString(json, 'kind'),
+      title: _readNullableString(json, 'title'),
+      metadata: _readObjectMap(json, 'metadata'),
+      memberCount: _readInt(json, 'memberCount'),
+      lastSeq: _readInt(json, 'lastSeq'),
+      lastMessageAt: _readNullableString(json, 'lastMessageAt'),
+      lastMessage: last == null ? null : ChatMessage.fromJson(last),
+      unreadCount: _readInt(json, 'unreadCount'),
+      lastReadSeq: _readInt(json, 'lastReadSeq'),
+      mutedUntil: _readNullableString(json, 'mutedUntil'),
+      peer: peer == null ? null : ChatPeer.fromJson(peer),
+      guildId: _readNullableString(json, 'guildId'),
+      channel: channel == null ? null : ChatChannel.fromJson(channel),
+      role: _readNullableString(json, 'role'),
+      canPost: _readBool(json, 'canPost'),
+      postDenied: denied == null ? null : ChatPostDenied.fromJson(denied),
+      canModerate: _readBool(json, 'canModerate'),
+      filterMode: _readString(json, 'filterMode'),
+      createdAt: _readString(json, 'createdAt'),
+      members: json['members'] is List ? _readList(json, 'members', ChatMember.fromJson) : null,
+    );
+  }
+}
+
+/// One page of the inbox from `chat.conversations(...)`.
+class ChatConversationPage {
+  final List<ChatConversation> conversations;
+
+  /// Pass as `offset` for the next page; null on the last page.
+  final int? nextOffset;
+
+  const ChatConversationPage({required this.conversations, this.nextOffset});
+
+  factory ChatConversationPage.fromJson(JsonMap json) => ChatConversationPage(
+        conversations: _readList(json, 'conversations', ChatConversation.fromJson),
+        nextOffset: _readNullableInt(json, 'nextOffset'),
+      );
+}
+
+/// One page of messages, oldest → newest.
+class ChatMessagePage {
+  final List<ChatMessage> messages;
+
+  /// More messages exist beyond this page in the direction you paged.
+  final bool hasMore;
+
+  const ChatMessagePage({required this.messages, required this.hasMore});
+
+  factory ChatMessagePage.fromJson(JsonMap json) => ChatMessagePage(
+        messages: _readList(json, 'messages', ChatMessage.fromJson),
+        hasMore: _readBool(json, 'hasMore'),
+      );
+}
+
+/// Unread messages across the inbox (muted conversations excluded): the
+/// app-icon badge.
+class ChatUnread {
+  final int total;
+
+  /// Conversations with at least one unread message.
+  final int conversations;
+
+  /// Unread messages per conversation kind.
+  final Map<String, int> byKind;
+
+  const ChatUnread({required this.total, required this.conversations, required this.byKind});
+
+  factory ChatUnread.fromJson(JsonMap json) => ChatUnread(
+        total: _readInt(json, 'total'),
+        conversations: _readInt(json, 'conversations'),
+        byKind: _readProgression(json, 'byKind') ?? <String, int>{},
+      );
+}
+
+/// The player's own chat preferences.
+class ChatPreferences {
+  /// true / false = their choice; null = each conversation kind's default.
+  final bool? profanityFilter;
+
+  /// `everyone`, `friends` or `nobody`: who they accept direct messages from.
+  final String allowDirectFrom;
+
+  const ChatPreferences({required this.profanityFilter, required this.allowDirectFrom});
+
+  factory ChatPreferences.fromJson(JsonMap json) {
+    final f = json['profanityFilter'];
+    return ChatPreferences(
+      profanityFilter: f is bool ? f : null,
+      allowDirectFrom: _readString(json, 'allowDirectFrom'),
+    );
+  }
+}
+
+/// One conversation kind's settings in [ChatClientConfig.kinds].
+/// [enabled] and [profanityFilter] exist on every kind; the rest
+/// (`allowFrom`, `maxMembers`, `maxGroupsPerPlayer`, `invitePolicy`, …)
+/// stay in [settings] so new fields reach the game without an SDK update.
+class ChatKindSettings {
+  final bool enabled;
+
+  /// `always`, `on_by_default` or `off_by_default`.
+  final String profanityFilter;
+
+  /// Every field the server sent, including [enabled] and [profanityFilter].
+  final Map<String, Object?> settings;
+
+  const ChatKindSettings({required this.enabled, required this.profanityFilter, required this.settings});
+
+  factory ChatKindSettings.fromJson(JsonMap json) => ChatKindSettings(
+        enabled: _readBool(json, 'enabled'),
+        profanityFilter: _readString(json, 'profanityFilter'),
+        settings: Map<String, Object?>.unmodifiable(json),
+      );
+}
+
+/// A game-defined card type for `sendCustom`.
+class ChatCustomType {
+  final String key;
+  final String? description;
+  final int maxPayloadBytes;
+
+  /// Optional JSON Schema the payload must match.
+  final Map<String, Object?>? schema;
+
+  const ChatCustomType({
+    required this.key,
+    required this.description,
+    required this.maxPayloadBytes,
+    required this.schema,
+  });
+
+  factory ChatCustomType.fromJson(JsonMap json) => ChatCustomType(
+        key: _readString(json, 'key'),
+        description: _readNullableString(json, 'description'),
+        maxPayloadBytes: _readInt(json, 'maxPayloadBytes'),
+        schema: _readNullableMap(json, 'schema'),
+      );
+}
+
+/// The game's chat rules as this player sees them, with their preferences
+/// and moderation standing: everything a chat screen needs at boot.
+class ChatClientConfig {
+  /// Settings per conversation kind (`direct`, `group`, `guild`, `channel`, …).
+  final Map<String, ChatKindSettings> kinds;
+
+  /// The public channels (empty when channel chat is off).
+  final List<ChatChannel> channels;
+
+  /// Characters per message.
+  final int maxLength;
+
+  /// false: links are masked like profanity.
+  final bool allowLinks;
+  final List<ChatCustomType> customTypes;
+
+  /// Seconds after sending during which a player may edit their own message
+  /// (`chat.editMessage`); 0 = editing is off.
+  final int editWindowSeconds;
+
+  /// Messages one player may send per minute, across conversations.
+  final int messagesPerMinute;
+  final ChatPreferences preferences;
+  final ModerationStatus status;
+
+  const ChatClientConfig({
+    required this.kinds,
+    required this.channels,
+    required this.maxLength,
+    required this.allowLinks,
+    required this.customTypes,
+    this.editWindowSeconds = 0,
+    required this.messagesPerMinute,
+    required this.preferences,
+    required this.status,
+  });
+
+  /// Whether a conversation kind is switched on in this game.
+  bool kindEnabled(String kind) => kinds[kind]?.enabled ?? false;
+
+  factory ChatClientConfig.fromJson(JsonMap json) {
+    final kinds = <String, ChatKindSettings>{};
+    final rawKinds = json['kinds'];
+    if (rawKinds is Map) {
+      rawKinds.forEach((k, v) {
+        if (v is Map) kinds['$k'] = ChatKindSettings.fromJson(v.cast<String, Object?>());
+      });
+    }
+    final messages = _readNullableMap(json, 'messages') ?? const <String, Object?>{};
+    final rateLimit = _readNullableMap(json, 'rateLimit') ?? const <String, Object?>{};
+    return ChatClientConfig(
+      kinds: kinds,
+      channels: _readList(json, 'channels', ChatChannel.fromJson),
+      maxLength: _readInt(messages, 'maxLength'),
+      allowLinks: _readBool(messages, 'allowLinks'),
+      customTypes: _readList(messages, 'customTypes', ChatCustomType.fromJson),
+      editWindowSeconds: _readInt(messages, 'editWindowSeconds'),
+      messagesPerMinute: _readInt(rateLimit, 'messagesPerMinute'),
+      preferences: ChatPreferences.fromJson(_readNullableMap(json, 'preferences') ?? const <String, Object?>{}),
+      status: ModerationStatus.fromJson(_readNullableMap(json, 'status') ?? const <String, Object?>{}),
+    );
+  }
+}
+
+// ── Moderation (docs/26) ───────────────────────────────────────────────
+
+/// Report categories accepted by `moderation.report`.
+abstract class ReportCategory {
+  static const String spam = 'spam';
+  static const String harassment = 'harassment';
+  static const String hateSpeech = 'hate_speech';
+  static const String sexualContent = 'sexual_content';
+  static const String violence = 'violence';
+  static const String selfHarm = 'self_harm';
+  static const String cheating = 'cheating';
+  static const String impersonation = 'impersonation';
+  static const String inappropriateName = 'inappropriate_name';
+  static const String other = 'other';
+}
+
+/// Where the reported behaviour happened (`moderation.report` `context`).
+abstract class ReportContext {
+  static const String chat = 'chat';
+  static const String profile = 'profile';
+  static const String guild = 'guild';
+  static const String gameplay = 'gameplay';
+  static const String other = 'other';
+}
+
+/// A report the player filed. The reviewer's decision stays private.
+class MyReport {
+  final String reportId;
+  final String targetExternalPlayerId;
+  final String category;
+  final String context;
+
+  /// `open`, `resolved` or `dismissed`.
+  final String status;
+  final String createdAt;
+  final String updatedAt;
+  final String? resolvedAt;
+
+  const MyReport({
+    required this.reportId,
+    required this.targetExternalPlayerId,
+    required this.category,
+    required this.context,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.resolvedAt,
+  });
+
+  factory MyReport.fromJson(JsonMap json) => MyReport(
+        reportId: _readString(json, 'reportId'),
+        targetExternalPlayerId: _readString(json, 'targetExternalPlayerId'),
+        category: _readString(json, 'category'),
+        context: _readString(json, 'context'),
+        status: _readString(json, 'status'),
+        createdAt: _readString(json, 'createdAt'),
+        updatedAt: _readString(json, 'updatedAt'),
+        resolvedAt: _readNullableString(json, 'resolvedAt'),
+      );
+}
+
+/// A restriction on the player: a warning, a chat mute or a chat ban.
+class Restriction {
+  final String restrictionId;
+
+  /// `warning`, `chat_mute` or `chat_ban`.
+  final String kind;
+
+  /// Shown to the player.
+  final String? reason;
+
+  /// `moderator`, `auto` or `server`.
+  final String source;
+  final String createdAt;
+
+  /// null = no expiry (a warning until acknowledged, an indefinite ban).
+  final String? expiresAt;
+  final String? liftedAt;
+  final String? acknowledgedAt;
+  final bool active;
+  final String? reportId;
+
+  const Restriction({
+    required this.restrictionId,
+    required this.kind,
+    required this.reason,
+    required this.source,
+    required this.createdAt,
+    required this.expiresAt,
+    required this.liftedAt,
+    required this.acknowledgedAt,
+    required this.active,
+    required this.reportId,
+  });
+
+  bool get isWarning => kind == 'warning';
+
+  factory Restriction.fromJson(JsonMap json) => Restriction(
+        restrictionId: _readString(json, 'restrictionId'),
+        kind: _readString(json, 'kind'),
+        reason: _readNullableString(json, 'reason'),
+        source: _readString(json, 'source'),
+        createdAt: _readString(json, 'createdAt'),
+        expiresAt: _readNullableString(json, 'expiresAt'),
+        liftedAt: _readNullableString(json, 'liftedAt'),
+        acknowledgedAt: _readNullableString(json, 'acknowledgedAt'),
+        active: _readBool(json, 'active'),
+        reportId: _readNullableString(json, 'reportId'),
+      );
+}
+
+/// The player's chat standing.
+class ModerationStatus {
+  /// false while chat-banned.
+  final bool canChat;
+
+  /// false while chat-banned or muted.
+  final bool canPost;
+  final String? mutedUntil;
+
+  /// Set while banned; null for an indefinite ban or no ban (check [canChat]).
+  final String? chatBannedUntil;
+
+  /// In force now; warnings stay until acknowledged.
+  final List<Restriction> restrictions;
+
+  const ModerationStatus({
+    required this.canChat,
+    required this.canPost,
+    required this.mutedUntil,
+    required this.chatBannedUntil,
+    required this.restrictions,
+  });
+
+  /// Warnings the player hasn't acknowledged yet: show them, then call
+  /// `moderation.acknowledgeWarning`.
+  List<Restriction> get pendingWarnings =>
+      restrictions.where((r) => r.isWarning && r.acknowledgedAt == null).toList(growable: false);
+
+  factory ModerationStatus.fromJson(JsonMap json) => ModerationStatus(
+        canChat: json['canChat'] is bool ? json['canChat']! as bool : true,
+        canPost: json['canPost'] is bool ? json['canPost']! as bool : true,
+        mutedUntil: _readNullableString(json, 'mutedUntil'),
+        chatBannedUntil: _readNullableString(json, 'chatBannedUntil'),
+        restrictions: _readList(json, 'restrictions', Restriction.fromJson),
       );
 }

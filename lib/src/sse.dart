@@ -6,7 +6,7 @@ import 'package:http/http.dart' as http;
 import 'errors.dart';
 
 /// Minimal Server-Sent Events reader shared by every Kraty stream
-/// (leaderboards, inventory). Parses the `event:` / `data:` line protocol
+/// (leaderboards, inventory, chat). Parses the `event:` / `data:` line protocol
 /// off a long-lived HTTP response and surfaces one [SseEvent] per event.
 ///
 /// No auto-reconnect on purpose: resumption policy differs per stream and
@@ -44,7 +44,8 @@ class SseStream {
 /// `http.Client.get`, which buffers the whole body) and parses the framing
 /// line by line. A blank line terminates an event; `event:` / `data:` are
 /// the fields we read; `:`-prefixed comment lines are heartbeats and are
-/// ignored. [label] only shapes error messages.
+/// ignored. [label] only shapes error messages. [headers] are added to
+/// the request (e.g. the chat stream's `X-Kraty-Chat-Filter`).
 Future<SseStream> openSseStream({
   required String baseUrl,
   required String path,
@@ -53,6 +54,7 @@ Future<SseStream> openSseStream({
   required String sdkUserAgent,
   required String label,
   String? playerSecret,
+  Map<String, String>? headers,
 }) async {
   final req = http.Request('GET', Uri.parse('$baseUrl$path'));
   req.headers['authorization'] = authHeader;
@@ -61,6 +63,7 @@ Future<SseStream> openSseStream({
   if (playerSecret != null && playerSecret.isNotEmpty) {
     req.headers['x-player-secret'] = playerSecret;
   }
+  if (headers != null) req.headers.addAll(headers);
 
   late http.StreamedResponse response;
   try {
